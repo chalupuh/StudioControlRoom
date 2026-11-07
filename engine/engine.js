@@ -162,6 +162,16 @@ function runAgent(stage, tierName, vars, feedback) {
 }
 
 // Checks decide success, never the model's own claim (ADR 0001 rule 5).
+// Fingerprint of the working tree (HEAD + uncommitted changes); null when the dir is not a git checkout.
+function treeSnapshot(dir) {
+  try {
+    const git = (a) => require('child_process').execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    return git(['rev-parse', 'HEAD']) + git(['status', '--porcelain']) + git(['diff']);
+  } catch { return null; }
+}
+// Stages that must produce changes: explicit "mustChange": true, or any stage whose id starts with "build".
+const mustChange = (stage) => stage.mustChange ?? /^build/.test(stage.id || '');
+
 function verify(stage, vars, res) {
   const problems = [];
   if (res.error) problems.push('run error: ' + res.error);
@@ -248,8 +258,11 @@ function advance(run) {
       if (paused(stage.agent)) break;
       ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
+      const before = treeSnapshot(workdir(vars));
       const res = runAgent(stage, tierName, vars, feedback);
       const problems = verify(stage, vars, res);
+      // Guard (2026-11-07): a build stage that changed nothing has not done its task, even if checks pass.
+      if (mustChange(stage) && before !== null && treeSnapshot(workdir(vars)) === before) problems.push('no files changed in ' + workdir(vars) + ' (the task was not implemented)');
       run.history.push({ stage: stage.id, agent: stage.agent, attempt: attempt + 1, ...res, ok: !problems.length, problems, at: now() });
       ev({ type: 'usage', agent: stage.agent, tier: tierName, model: res.model, cloud: res.cloud, tokensIn: res.usage?.in || 0, tokensOut: res.usage?.out || 0, secs: res.secs });
       if (!problems.length) {
@@ -308,4 +321,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { parseRunOutput, verify, resolveTeamLead, agentDefinition };
+module.exports = { parseRunOutput, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange };
