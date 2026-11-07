@@ -70,6 +70,19 @@ function fill(tpl, vars) {
     .replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] ?? `{{${k}}}`));
 }
 
+// Read an HQ role file (.claude/agents/<name>.md) into Claude Code's --agents JSON shape.
+function agentDefinition(name) {
+  const f = path.join(REPO, '.claude', 'agents', name + '.md');
+  if (!fs.existsSync(f)) return null;
+  const txt = fs.readFileSync(f, 'utf8');
+  const m = txt.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) return { description: name, prompt: txt };
+  const fm = Object.fromEntries(m[1].split(/\r?\n/).map((l) => l.match(/^(\w+):\s*(.*)$/)).filter(Boolean).map((x) => [x[1], x[2].trim()]));
+  const def = { description: fm.description || name, prompt: m[2].trim() };
+  if (fm.tools) def.tools = fm.tools.split(',').map((t) => t.trim()).filter(Boolean);
+  return def;
+}
+
 // Agents, checks and scripts run in vars.workdir (absolute, or relative to REPO) when set; else in REPO.
 const workdir = (vars) => (vars && vars.workdir ? path.resolve(REPO, fill(vars.workdir, vars)) : REPO);
 const runFile = (id) => path.join(RUNS, id + '.json');
@@ -124,6 +137,15 @@ function runAgent(stage, tierName, vars, feedback) {
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files: ${stage.expect.map((e) => fill(e, vars)).join(', ')}.`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
   const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(stage.maxTurns || 25)];
+  // Working outside HQ (e.g. a StudioControlRoom worktree): that checkout has no .claude/agents or
+  // hooks, so pass the role definition and HQ's settings (pause hook, event logging) explicitly.
+  if (cwd !== REPO) {
+    const def = agentDefinition(stage.agent);
+    if (def) args.push('--agents', JSON.stringify({ [stage.agent]: def }));
+    const hqSettings = path.join(REPO, '.claude', 'settings.json');
+    if (fs.existsSync(hqSettings)) args.push('--settings', hqSettings);
+    args.push('--add-dir', REPO); // HQ docs (backlogs, sprint log, QA, reviews) must stay writable
+  }
   if (stage.allowedTools) args.push('--allowedTools', ...stage.allowedTools);
   const t0 = Date.now();
   const r = spawnSync(claudeExe(), args, { cwd: workdir(vars), env, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 });
@@ -282,4 +304,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { parseRunOutput, verify, resolveTeamLead };
+module.exports = { parseRunOutput, verify, resolveTeamLead, agentDefinition };
