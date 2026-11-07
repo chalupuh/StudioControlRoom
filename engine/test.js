@@ -10,6 +10,7 @@ const SUITES = [
   { file: 'selftest.js',              label: 'parseRunOutput / verify' },
   { file: 'selftest-team-lead.js',    label: 'resolveTeamLead' },
   { file: 'selftest-foreach.js',      label: 'foreach expansion (Windows paths)' },
+  { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
 ];
 
 let anyFailed = false;
