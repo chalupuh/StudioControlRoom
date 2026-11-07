@@ -70,6 +70,10 @@ function fill(tpl, vars) {
     .replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] ?? `{{${k}}}`));
 }
 
+// Forward slashes: these paths are substituted into JS/JSON/shell strings in pipeline commands, where
+// Windows backslashes become escape sequences and break the path.
+const toSlash = (p) => String(p).split(String.fromCharCode(92)).join('/');
+
 // Read an HQ role file (.claude/agents/<name>.md) into Claude Code's --agents JSON shape.
 function agentDefinition(name) {
   const f = path.join(REPO, '.claude', 'agents', name + '.md');
@@ -284,7 +288,7 @@ if (require.main === module) {
 		const name = rest[0];
 		const pipe = JSON.parse(fs.readFileSync(path.join(PIPES, name + '.json'), 'utf8'));
 		const id = `${name}-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${Math.random().toString(36).slice(2, 5)}`;
-		const run = { id, pipeline: name, vars: { date: new Date().toISOString().slice(0, 10), soft: path.resolve(__dirname, '..'), home: REPO, ...pipe.defaults, ...vars }, stages: pipe.stages, cursor: 0, gates: {}, history: [], status: 'running', created: now() };
+		const run = { id, pipeline: name, vars: { date: new Date().toISOString().slice(0, 10), soft: toSlash(path.resolve(__dirname, '..')), home: toSlash(REPO), ...pipe.defaults, ...vars }, stages: pipe.stages, cursor: 0, gates: {}, history: [], status: 'running', created: now() };
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
 		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
 	} else if (cmd === 'resume') {

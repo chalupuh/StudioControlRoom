@@ -10,7 +10,7 @@ fs.writeFileSync(path.join(home, 'items.md'), '- [ ] [x] alpha\n- [ ] [y] beta "
 const pipeline = {
   description: 'foreach escape test', defaults: {},
   stages: [{ id: 'loop', type: 'foreach', items: { file: 'items.md', regex: '^- \\[ \\] \\[(\\w+)\\] (.+)$' },
-    stages: [{ id: 's', type: 'script', run: 'node -e "require(\'fs\').appendFileSync(\'out.txt\', process.argv[1] + \'\\n\')" "{{g2}} | {{winpath}}"' }] }],
+    stages: [{ id: 'read-home', type: 'script', run: 'node -e "require(\'fs\').readFileSync(\'{{home}}/items.md\')"' }, { id: 's', type: 'script', run: 'node -e "require(\'fs\').appendFileSync(\'out.txt\', process.argv[1] + \'\\n\')" "{{g2}} | {{winpath}}"' }] }],
 };
 fs.writeFileSync(path.join(home, 'tools', 'engine', 'pipelines', 't.json'), JSON.stringify(pipeline));
 
@@ -22,6 +22,7 @@ const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if
 check(r.status === 0 && !/SyntaxError/.test(r.stderr + r.stdout), 'engine expands foreach without crashing');
 check(out.includes('alpha | C:\\Users\\someone\\AI Dev Co'), 'Windows backslash path survives into the stage');
 check(out.includes('beta'), 'second item ran');
+check(!/blocked/i.test(r.stdout), '{{home}} path is usable inside a node -e command (forward slashes)');
 fs.rmSync(home, { recursive: true, force: true });
 console.log(fails ? `\n${fails} failed` : '\nforeach selftest passed');
 process.exit(fails ? 1 : 0);
