@@ -1,0 +1,9 @@
+{
+  "id": "water-goal",
+  "system": "You are a senior engineer. Reply with ONE ```js code block containing an ES module. No explanation.",
+  "prompt": "Write and export a function dailyWaterGoalMl({ weightKg, activityMinutes = 0, hotClimate = false }).\nRules: base = weightKg * 35 ml. Add 12 ml per activity minute. If hotClimate add 500 ml.\nRound to the nearest 50 ml. Throw a RangeError if weightKg is not a number between 20 and 300.",
+  "check": {
+    "type": "tests",
+    "tests": "import { test } from 'node:test'; import assert from 'node:assert/strict';\nimport { dailyWaterGoalMl as f } from './solution.mjs';\ntest('base', () => assert.equal(f({ weightKg: 70 }), 2450));\ntest('activity', () => assert.equal(f({ weightKg: 70, activityMinutes: 30 }), 2800));\ntest('hot + round', () => assert.equal(f({ weightKg: 61, hotClimate: true }), 2650));\ntest('range', () => { assert.throws(() => f({ weightKg: 10 }), RangeError); assert.throws(() => f({ weightKg: 'x' }), RangeError); });"
+  }
+}

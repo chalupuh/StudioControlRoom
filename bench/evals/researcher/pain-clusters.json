@@ -1,0 +1,20 @@
+{
+  "id": "pain-clusters",
+  "system": "You are a market researcher. Only use the evidence given. Never invent numbers.",
+  "prompt": "Cluster these app-review complaints into at most 4 pain themes, each with a count and one short paraphrased example. Then name the single biggest opportunity.\n1 \"Paywall after 7 days just to set reminders\" 2 \"Ads every time I log water\" 3 \"Lost all my data when I switched phones\" 4 \"Too many settings, I just want to tap once\" 5 \"Subscription for a counter? no\" 6 \"No widget\" 7 \"Sync broke and my streak reset\" 8 \"Video ads between screens\" 9 \"Why does it need an account\" 10 \"Wish it had a home-screen widget to log quickly\"",
+  "check": {
+    "type": "contains",
+    "all": [
+      "paywall|subscription|price",
+      "ad",
+      "sync|data|backup",
+      "widget|quick|one tap|simpl"
+    ]
+  },
+  "rubric": [
+    "Counts add up to 10 and match the reviews",
+    "No invented statistics",
+    "Opportunity is specific (e.g. one-time price, no ads, widget quick-log, local backup)",
+    "At most 4 themes"
+  ]
+}

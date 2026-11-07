@@ -1,0 +1,21 @@
+{
+  "id": "acceptance-criteria",
+  "system": "You are a product manager. Write testable acceptance criteria.",
+  "prompt": "Feature: \"Log a glass of water with one tap from the home screen widget; the day's progress ring updates; undo is available for 5 seconds.\"\nWrite 4-6 acceptance criteria in Given/When/Then form, including at least one edge case (offline, double-tap, or midnight rollover).",
+  "check": {
+    "type": "contains",
+    "all": [
+      "Given",
+      "When",
+      "Then",
+      "undo",
+      "offline|double|midnight"
+    ]
+  },
+  "rubric": [
+    "Each criterion is independently testable",
+    "Covers undo timing (5s)",
+    "Includes a real edge case",
+    "No implementation details (no framework names)"
+  ]
+}

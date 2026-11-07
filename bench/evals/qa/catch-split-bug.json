@@ -1,0 +1,10 @@
+{
+  "id": "catch-split-bug",
+  "system": "You are a QA engineer. Reply with ONE ```js code block of node:test tests (import { test } from 'node:test'; import assert from 'node:assert/strict'; import { splitBill } from './solution.mjs'). No explanation.",
+  "prompt": "Write thorough tests for splitBill(totalCents, people) which must return an array of length people whose items are integers, sum EXACTLY to totalCents, and differ from each other by at most 1 cent (larger shares first). It throws RangeError if people < 1. Cover edge cases.",
+  "check": {
+    "type": "catches-bug",
+    "buggy": "export function splitBill(t, p){ if(p<1) throw new RangeError('p'); const s=Math.round(t/p); return Array(p).fill(s); }",
+    "fixed": "export function splitBill(t, p){ if(p<1) throw new RangeError('p'); const b=Math.floor(t/p), r=t-b*p; return Array.from({length:p},(_,i)=>b+(i<r?1:0)); }"
+  }
+}

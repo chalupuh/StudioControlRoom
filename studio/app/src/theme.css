@@ -1,0 +1,39 @@
+/* Design tokens + shell styles. Feature CSS lives next to each feature (features/org/org.css, features/ops/ops.css). */
+:root {
+  --bg: #0a0d14; --bg2: #0f1420; --panel: #131a29; --panel2: #18213a; --line: #24304a; --line2: #2f3d5c;
+  --text: #e8edf7; --muted: #8a97b2; --faint: #5a6784;
+  --working: #3ea6ff; --done: #34d399; --blocked: #f87171; --paused: #fbbf24; --idle: #4a5670;
+  --brain: #c4a7ff; --local: #6ee7b7;
+  --eng: #3ea6ff; --rd: #a78bfa; --creative: #f472b6; --owner: #fbbf24;
+  --radius: 14px; --shadow: 0 10px 30px -12px rgba(0,0,0,.6);
+  --font: 'Space Grotesk', system-ui, sans-serif; --mono: 'JetBrains Mono', ui-monospace, monospace;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f4f6fb; --bg2: #eef1f8; --panel: #ffffff; --panel2: #f3f5fa; --line: #dde3ee; --line2: #c9d2e3;
+  --text: #121826; --muted: #5b6780; --faint: #8b96ad; color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; min-height: 100%; }
+body { background: radial-gradient(1200px 600px at 20% -10%, #17264a 0%, transparent 60%), var(--bg); color: var(--text); font-family: var(--font); }
+button { font: inherit; color: inherit; }
+.shell { min-height: 100vh; display: flex; flex-direction: column; }
+.top { display: flex; align-items: center; gap: 16px; padding: 14px 24px; border-bottom: 1px solid var(--line); flex-wrap: wrap; position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 85%, transparent); backdrop-filter: blur(8px); z-index: 20; }
+.top h1 { margin: 0; font-size: 16px; letter-spacing: .1em; text-transform: uppercase; font-weight: 600; }
+.top h1 span { color: var(--owner); }
+.live { display: inline-flex; align-items: center; gap: 6px; font: 12px var(--mono); color: var(--muted); }
+.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--done); box-shadow: 0 0 10px var(--done); }
+.live.off i { background: var(--blocked); box-shadow: 0 0 10px var(--blocked); }
+.tabs { display: flex; gap: 4px; margin-left: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 3px; }
+.tabs button { background: none; border: 0; padding: 7px 14px; border-radius: 8px; cursor: pointer; color: var(--muted); }
+.tabs button[aria-selected="true"] { background: var(--panel2); color: var(--text); }
+.badge { display: inline-block; margin-left: 6px; min-width: 18px; padding: 0 5px; border-radius: 99px; background: var(--blocked); color: #fff; font-size: 11px; }
+.switch { display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 12px; cursor: pointer; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; font-size: 12px; }
+.switch .track { width: 44px; height: 24px; border-radius: 99px; background: #3b1518; position: relative; }
+.switch .knob { position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--blocked); transition: left .2s; }
+.switch.on .track { background: #0f3428; } .switch.on .knob { left: 23px; background: var(--done); }
+.banner { margin: 12px 24px 0; padding: 10px 14px; border-radius: 10px; border: 1px solid #7a5a12; background: #2a2109; color: var(--paused); font-size: 13px; }
+main { flex: 1; padding: 20px 24px; }
+.loading { color: var(--muted); padding: 40px; text-align: center; }
+@media (max-width: 720px) { .top { padding: 12px 16px; } main { padding: 16px; } .tabs { margin-left: 0; order: 3; width: 100%; } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

@@ -1,0 +1,19 @@
+{
+  "id": "scope-cut",
+  "system": "You are a product manager for a studio that ships small MVPs in ≤ 2 weeks.",
+  "prompt": "The owner's wishlist for a habit tracker MVP: streaks with grace days, reminders, home widget, Apple Health sync, social leaderboards, custom themes, CSV export, AI coach chat, dark mode, iCloud backup.\nSplit into \"MVP (≤2 weeks)\" and \"Later\", max 5 MVP items, with one line of reasoning each.",
+  "check": {
+    "type": "contains",
+    "all": [
+      "MVP",
+      "Later",
+      "streak"
+    ]
+  },
+  "rubric": [
+    "MVP ≤ 5 items and buildable in 2 weeks",
+    "Defers leaderboards, AI coach and Health sync",
+    "Keeps streaks + reminders",
+    "Reasoning is concrete"
+  ]
+}

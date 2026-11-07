@@ -1,0 +1,9 @@
+{
+  "id": "shift-pattern",
+  "system": "You are a senior engineer. Reply with ONE ```js code block containing an ES module. No explanation.",
+  "prompt": "Export shiftOn(pattern, startDate, date) for a rotating-shift calendar.\npattern: array like ['D','D','N','N','O','O','O','O'] repeating forever from startDate ('YYYY-MM-DD', the first day of the pattern).\nReturn the pattern entry for date ('YYYY-MM-DD'). Dates BEFORE startDate also follow the cycle backwards. Use UTC.",
+  "check": {
+    "type": "tests",
+    "tests": "import { test } from 'node:test'; import assert from 'node:assert/strict';\nimport { shiftOn as s } from './solution.mjs';\nconst P = ['D','D','N','N','O','O','O','O'];\ntest('start', () => assert.equal(s(P, '2026-11-01', '2026-11-01'), 'D'));\ntest('forward', () => { assert.equal(s(P, '2026-11-01', '2026-11-03'), 'N'); assert.equal(s(P, '2026-11-01', '2026-11-09'), 'D'); });\ntest('backwards', () => assert.equal(s(P, '2026-11-01', '2026-10-31'), 'O'));\ntest('across DST/month', () => assert.equal(s(P, '2026-03-01', '2026-04-02'), 'D'));"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "month-totals",
+  "system": "You are a senior engineer. Reply with ONE ```js code block containing an ES module. No explanation.",
+  "prompt": "Export monthTotals(expenses) where expenses = [{ date: 'YYYY-MM-DD', cents: number, category: string }].\nReturn an array of { month: 'YYYY-MM', total: number, top: string } sorted by month ascending, where top is the category with the highest total that month (ties: alphabetical first). Ignore entries with negative cents.",
+  "check": {
+    "type": "tests",
+    "tests": "import { test } from 'node:test'; import assert from 'node:assert/strict';\nimport { monthTotals as m } from './solution.mjs';\ntest('groups and sorts', () => assert.deepEqual(m([\n  { date: '2026-02-03', cents: 500, category: 'food' }, { date: '2026-01-10', cents: 200, category: 'rent' },\n  { date: '2026-02-20', cents: 700, category: 'fun' }, { date: '2026-02-21', cents: 300, category: 'food' },\n  { date: '2026-01-11', cents: -50, category: 'food' }]),\n  [{ month: '2026-01', total: 200, top: 'rent' }, { month: '2026-02', total: 1500, top: 'food' }]));\ntest('tie alphabetical', () => assert.deepEqual(m([{ date: '2026-03-01', cents: 100, category: 'b' }, { date: '2026-03-02', cents: 100, category: 'a' }]), [{ month: '2026-03', total: 200, top: 'a' }]));\ntest('empty', () => assert.deepEqual(m([]), []));"
+  }
+}

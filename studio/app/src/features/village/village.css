@@ -1,0 +1,62 @@
+/* Village view. Prefix v- keeps it isolated. Uses tokens from theme.css only. */
+.v-root { position: relative; width: 100%; }
+.v-loading { color: var(--muted); padding: 40px; text-align: center; }
+
+/* SVG map container */
+.v-map {
+  width: 100%;
+  height: auto;
+  max-height: 70vh;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: block;
+}
+
+/* Character interaction */
+.v-char { cursor: pointer; transition: opacity .15s; }
+.v-char:hover { opacity: .85; }
+.v-char:focus-visible circle { outline: 2px solid var(--text); outline-offset: 2px; }
+
+/* Speech bubble */
+.v-bubble { pointer-events: none; }
+.v-bubble rect { animation: v-float 3s ease-in-out infinite; }
+@keyframes v-float { 0%, 100% { opacity: .9; } 50% { opacity: 1; } }
+
+/* Legend */
+.v-legend {
+  display: flex;
+  gap: 16px;
+  padding: 12px 0 0;
+  flex-wrap: wrap;
+}
+.v-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 11px var(--mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.v-legend-item i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: var(--accent);
+  flex: none;
+}
+
+/* Reduced motion: no animations, positions snap */
+@media (prefers-reduced-motion: reduce) {
+  .v-bubble rect { animation: none; }
+  .v-char { cursor: pointer; }
+  .v-char:hover { opacity: 1; }
+}
+
+/* Responsive: on narrow screens the map takes full width */
+@media (max-width: 720px) {
+  .v-map { max-height: 60vh; }
+  .v-legend { gap: 10px; padding: 10px 0 0; }
+  .v-legend-item { font-size: 10px; }
+}

@@ -1,0 +1,9 @@
+{
+  "id": "parse-duration",
+  "system": "You are a senior engineer. Reply with ONE ```js code block containing an ES module. No explanation.",
+  "prompt": "Export parseDuration(str) that converts strings like \"1h30m\", \"45m\", \"2h\", \"90s\", \"1h 5m 10s\" (spaces optional, units h/m/s, any order not allowed: must be h then m then s) into total seconds.\nThrow a TypeError for empty or invalid input (e.g. \"\", \"abc\", \"5x\", \"30m1h\", \"1.5h\").",
+  "check": {
+    "type": "tests",
+    "tests": "import { test } from 'node:test'; import assert from 'node:assert/strict';\nimport { parseDuration as p } from './solution.mjs';\ntest('basic', () => { assert.equal(p('1h30m'), 5400); assert.equal(p('45m'), 2700); assert.equal(p('2h'), 7200); assert.equal(p('90s'), 90); });\ntest('spaces', () => assert.equal(p('1h 5m 10s'), 3910));\ntest('invalid', () => { for (const s of ['', 'abc', '5x', '30m1h', '1.5h']) assert.throws(() => p(s), TypeError, s); });"
+  }
+}

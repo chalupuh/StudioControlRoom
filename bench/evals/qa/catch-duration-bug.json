@@ -1,0 +1,10 @@
+{
+  "id": "catch-duration-bug",
+  "system": "You are a QA engineer. Reply with ONE ```js code block of node:test tests (import { test } from 'node:test'; import assert from 'node:assert/strict'; import { parseDuration } from './solution.mjs'). No explanation.",
+  "prompt": "Write thorough tests for parseDuration(str): converts \"1h30m\", \"45m\", \"2h\", \"90s\", \"1h 5m 10s\" into seconds; units must appear in h, m, s order; throws TypeError on empty or invalid input such as \"abc\", \"5x\", \"30m1h\", \"1.5h\".",
+  "check": {
+    "type": "catches-bug",
+    "buggy": "export function parseDuration(s){ const m=String(s).replace(/\\s/g,'').match(/^(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+)s)?$/); if(!m) throw new TypeError('bad'); return (+(m[1]||0))*3600+(+(m[2]||0))*60+(+(m[3]||0)); }",
+    "fixed": "export function parseDuration(s){ const t=String(s).replace(/\\s/g,''); const m=t.match(/^(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+)s)?$/); if(!t||!m) throw new TypeError('bad'); return (+(m[1]||0))*3600+(+(m[2]||0))*60+(+(m[3]||0)); }"
+  }
+}

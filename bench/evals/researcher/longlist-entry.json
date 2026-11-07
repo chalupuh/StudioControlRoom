@@ -1,0 +1,21 @@
+{
+  "id": "longlist-entry",
+  "system": "You are a market researcher. Only use the evidence given; label anything else as an assumption.",
+  "prompt": "From this evidence, write ONE longlist entry with these headings: Idea, Demand signals, Pain signals, Competing apps, The gap, Quick take (Hot/Warm/Cold).\nEvidence:\n- Store listing A (\"FocusTree-like timer\", 4.7★, ~500k ratings): reviews complain the free tier limits sessions to 3/day; several say \"subscription for a timer is ridiculous\".\n- Store listing B (4.4★, ~80k ratings): reviews praise visuals, complain about no web version and frequent ads.\n- Reddit r/productivity thread (120 upvotes): \"any one-time-purchase focus timer that syncs phone and laptop?\"\nKeep it under 150 words.",
+  "check": {
+    "type": "contains",
+    "all": [
+      "Demand",
+      "Pain",
+      "Compet",
+      "gap",
+      "Hot|Warm|Cold"
+    ]
+  },
+  "rubric": [
+    "Uses only given evidence; no invented numbers",
+    "Gap = one-time purchase + cross-device",
+    "Under 150 words",
+    "Sensible Hot/Warm call"
+  ]
+}

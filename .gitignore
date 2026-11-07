@@ -1,0 +1,8 @@
+node_modules/
+studio/app-dist/
+bench/results/
+# machine-local: points at this PC's AIDevCompanyHQ checkout
+studio.home.json
+*.log
+*.part
+temp_*

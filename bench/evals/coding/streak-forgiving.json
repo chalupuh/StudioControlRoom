@@ -1,0 +1,9 @@
+{
+  "id": "streak-forgiving",
+  "system": "You are a senior engineer. Reply with ONE ```js code block containing an ES module. No explanation.",
+  "prompt": "Export function streak(dates, today, graceDays = 1).\ndates: array of 'YYYY-MM-DD' strings (unsorted, may contain duplicates) when a habit was done. today: 'YYYY-MM-DD'.\nReturn the current streak length in DAYS DONE, counting back from today (or from yesterday if today isn't done yet).\nA gap of up to graceDays missed days in a row does not break the streak (missed days don't count toward the length).\nA longer gap ends the streak. Return 0 if nothing counts. Use UTC date math.",
+  "check": {
+    "type": "tests",
+    "tests": "import { test } from 'node:test'; import assert from 'node:assert/strict';\nimport { streak as s } from './solution.mjs';\ntest('simple', () => assert.equal(s(['2026-11-04','2026-11-05','2026-11-06'], '2026-11-06'), 3));\ntest('today not done yet', () => assert.equal(s(['2026-11-04','2026-11-05'], '2026-11-06'), 2));\ntest('grace gap', () => assert.equal(s(['2026-11-02','2026-11-03','2026-11-05','2026-11-06'], '2026-11-06'), 4));\ntest('gap too long', () => assert.equal(s(['2026-11-01','2026-11-02','2026-11-05','2026-11-06'], '2026-11-06'), 2));\ntest('dupes + unsorted', () => assert.equal(s(['2026-11-06','2026-11-05','2026-11-06'], '2026-11-06'), 2));\ntest('empty', () => assert.equal(s([], '2026-11-06'), 0));"
+  }
+}

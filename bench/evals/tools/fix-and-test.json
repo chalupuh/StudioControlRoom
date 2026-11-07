@@ -1,0 +1,94 @@
+{
+  "id": "fix-and-test",
+  "system": "You are a coding agent. Use the tools to complete the task. When finished, reply with a one-line summary.",
+  "prompt": "The test in tests/total.test.js is failing. Read src/total.js, fix the bug, write the fixed file, then run the tests with `npm test`.",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a file in the repo",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Write a file in the repo",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "content": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run",
+        "description": "Run a shell command",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    }
+  ],
+  "toolResults": {
+    "read_file": {
+      "src/total.js": "export const total = (items) => items.reduce((s, i) => s + i.price, 0);",
+      "tests/total.test.js": "import { total } from '../src/total.js';\ntest('qty', () => expect(total([{ price: 2, qty: 3 }])).toBe(6));",
+      "*": "ENOENT: no such file"
+    },
+    "write_file": "written",
+    "run": "PASS tests/total.test.js (3 tests)"
+  },
+  "check": {
+    "type": "tool-calls",
+    "sequence": [
+      "read_file",
+      "write_file",
+      "run"
+    ],
+    "args": [
+      [
+        "write_file",
+        "content",
+        "qty"
+      ],
+      [
+        "run",
+        "command",
+        "npm test"
+      ]
+    ]
+  }
+}

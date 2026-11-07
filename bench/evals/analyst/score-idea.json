@@ -1,0 +1,16 @@
+{
+  "id": "score-idea",
+  "system": "You are an opportunity analyst for an app studio. Be concise.",
+  "prompt": "Score this idea with the studio rubric and give the Opportunity Score.\nWeights: Demand 20%, Gap 20%, Ease 20%, Monetization 10%, Competition 10%, Retention 10%, Risk 10%. Score = sum(score*weight)/5*100.\nIdea: \"Plant watering reminder app with photo-based plant ID and per-plant schedules.\"\nEvidence: plant care apps chart in Lifestyle; top competitors have 4.5+ stars but frequent 1-star reviews about subscription paywalls for reminders; photo ID needs an external API or model (adds cost/complexity); people use them weekly.\nUse these scores exactly: Demand 4, Gap 3, Ease 3, Monetization 3, Competition 2, Retention 4, Risk 4.\nShow the arithmetic, the final score, one-line justification per criterion, and an MVP list of max 5 features.",
+  "check": {
+    "type": "number",
+    "value": 66,
+    "tolerance": 0.6
+  },
+  "rubric": [
+    "Arithmetic shown and correct (66)",
+    "Justifications reference the evidence, not generic",
+    "MVP is small and drops photo ID or defers it given Ease 3",
+    "Concise"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "rank-two",
+  "system": "You are an opportunity analyst for an app studio. Be concise.",
+  "prompt": "Two ideas, weights Demand 20, Gap 20, Ease 20, Money 10, Competition 10, Retention 10, Risk 10 (score = sum(score*weight)/5*100).\nA) Offline envelope budget: Demand 4, Gap 3, Ease 4, Money 3, Competition 2, Retention 5, Risk 4.\nB) Visa days-in-country tracker: Demand 3, Gap 4, Ease 5, Money 3, Competition 4, Retention 1, Risk 2.\nCompute both scores, say which ranks first, and give one risk the owner must review for each.",
+  "check": {
+    "type": "contains",
+    "all": [
+      "72",
+      "68"
+    ]
+  },
+  "rubric": [
+    "A=72, B=68 correct, A ranks first",
+    "Budget risk mentions financial advice/data sensitivity",
+    "Visa risk mentions legal/immigration accuracy",
+    "Concise"
+  ]
+}

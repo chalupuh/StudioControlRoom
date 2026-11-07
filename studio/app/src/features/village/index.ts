@@ -1,0 +1,1 @@
+export { VillageView } from './VillageView';

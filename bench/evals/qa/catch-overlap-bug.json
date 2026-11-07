@@ -1,0 +1,10 @@
+{
+  "id": "catch-overlap-bug",
+  "system": "You are a QA engineer. Reply with ONE ```js code block of node:test tests (import { test } from 'node:test'; import assert from 'node:assert/strict'; import { overlaps } from './solution.mjs'). No explanation.",
+  "prompt": "Write thorough tests for overlaps(a, b) where a and b are { start: number, end: number } half-open intervals [start, end). Returns true if they share any time. Intervals that only touch (a.end === b.start) do NOT overlap. Zero-length intervals never overlap anything.",
+  "check": {
+    "type": "catches-bug",
+    "buggy": "export const overlaps=(a,b)=> a.start<=b.end && b.start<=a.end && a.end>a.start && b.end>b.start;",
+    "fixed": "export const overlaps=(a,b)=> a.start<b.end && b.start<a.end && a.end>a.start && b.end>b.start;"
+  }
+}
