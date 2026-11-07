@@ -13,6 +13,8 @@
 //   gate    { id, title, show:[paths] }            stops until the owner approves
 //   script  { id, run:"cmd" }                       deterministic step, no model
 //   foreach { id, items:{ file, regex }, stages:[...] }  repeats sub-stages per match ({{item}})
+//   agent stages may add  rework:{ to:"build", verdict:"<report path template>", max:3, failRegex?:"..." }
+//   so an honest 'VERDICT: FAIL' loops back to the build stage (same foreach item) instead of climbing tiers.
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
@@ -117,7 +119,7 @@ function parseRunOutput(r) {
 }
 
 // ---- run one agent stage on a given tier ----
-function runAgent(stage, tierName, vars, feedback) {
+function runAgent(stage, tierName, vars, feedback, reworkNote) {
   const tier = TIERS[tierName];
   const env = { ...process.env };
   // Headless Claude Code on Windows needs Git Bash for its Bash tool; without this, agents have
@@ -139,6 +141,7 @@ function runAgent(stage, tierName, vars, feedback) {
   const logCmd = cwd === REPO ? 'node .studio/studio.js' : `node "${STUDIO}"`;
   prompt += `\n\nStudio rules: work only inside this repository (${cwd}). Org docs, specs and backlogs live in ${REPO} (read-only unless the task says to write there). Report progress with \`${logCmd} log ${stage.agent} <pct> "<msg>"\`.`;
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files: ${stage.expect.map((e) => fill(e, vars)).join(', ')}.`;
+  if (reworkNote) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
   const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(stage.maxTurns || 25)];
   // Working outside HQ (e.g. a StudioControlRoom worktree): that checkout has no .claude/agents or
@@ -205,6 +208,44 @@ function resolveTeamLead(designPath) {
 	return 'mobile-dev';
 }
 
+// ---- QA/review rework loop (CLAUDE.md: failed QA/review goes back to the same engineer, 3 loops, then owner) ----
+// Returns 'none' (no valid FAIL verdict: normal verify/tier logic applies), 'back' (cursor moved to the build
+// stage) or 'blocked'. Only a stage that ran cleanly and wrote a fresh report containing a FAIL verdict counts;
+// missing report, run error, turn cap or empty answer stay genuine failures that climb the tier ladder.
+function handleRework(run, stage, vars, res, t0) {
+  const rw = stage.rework;
+  if (!rw || res.error || res.hitTurnCap || !String(res.result || '').trim()) return 'none';
+  const rp = path.resolve(REPO, fill(rw.verdict, vars));
+  let txt; try { if (fs.statSync(rp).mtimeMs < t0 - 2000) return 'none'; txt = fs.readFileSync(rp, 'utf8'); } catch { return 'none'; }
+  if (!new RegExp(rw.failRegex || 'VERDICT:\\s*FAIL').test(txt)) return 'none';
+  const max = rw.max || 3;
+  run.reworks = run.reworks || {};
+  const n = run.reworks[stage.id] = (run.reworks[stage.id] || 0) + 1;
+  const suffix = (stage.id.match(/#\d+$/) || [''])[0];
+  const cur = run.cursor;
+  const target = run.stages.findIndex((s, i) => i < cur && (suffix ? s.id === rw.to + suffix : (s.id === rw.to || s.id.startsWith(rw.to + '#'))));
+  // keep history: <name>.md -> <name>-round<N>.md (also forces the next QA/review to write a fresh report)
+  const kept = rp.replace(/(\.[^./\\]+)?$/, (e) => `-round${n}${e || ''}`);
+  try { fs.renameSync(rp, kept); } catch {}
+  if (n >= max || target < 0) {
+    run.status = 'blocked';
+    run.blockedReason = target < 0 ? `${stage.id} FAIL but no '${rw.to}' stage to rework` : `QA/review failed ${max} rework rounds`;
+    save(run);
+    ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. ${run.blockedReason}.` });
+    console.log(`\n⛔ BLOCKED at ${stage.id}: ${run.blockedReason}. Last report: ${kept}`);
+    return 'blocked';
+  }
+  const back = run.stages[target];
+  run.reworkNotes = run.reworkNotes || {};
+  run.reworkNotes[back.id] = `Rework round ${n}: QA/review FAILED. Fix every finding in ${toSlash(kept)}, then update the sprint log.`;
+  run.history.push({ stage: stage.id, type: 'rework', round: n, max, back: back.id, report: toSlash(kept), at: now() });
+  ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'working', message: `rework ${n}/${max}: ${stage.id} FAIL → back to ${back.id}` });
+  console.log(`  ↩ rework ${n}/${max}: ${stage.id} FAIL → back to ${back.id}`);
+  run.cursor = target; save(run);
+  return 'back';
+}
+const hooks = { runAgent: (...a) => runAgent(...a) }; // test seam: selftests swap in a fake agent
+
 // ---- the state machine ----
 function advance(run) {
   while (run.cursor < run.stages.length) {
@@ -251,15 +292,22 @@ function advance(run) {
       const designPath = fill(stage.designDoc || '{{slug}}.design.md', vars);
       stage.agent = resolveTeamLead(designPath);
     }
+    // Ladder attempts are counted per advance() call: `resume` starts the ladder afresh (a human decided to retry),
+    // so a stage blocked on every tier gets at most one full ladder per resume, never more within a single call.
     const ladder = LADDER[stage.tier || 'local'];
-    let feedback = null, done = false;
+    let feedback = null, done = false, reworked = false;
+    const reworkNote = run.reworkNotes && run.reworkNotes[stage.id];
     for (let attempt = 0; attempt < ladder.length && !done; attempt++) {
       const tierName = ladder[attempt];
       if (paused(stage.agent)) break;
       ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
-      const res = runAgent(stage, tierName, vars, feedback);
+      const t0 = Date.now();
+      const res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
+      const rwState = handleRework(run, stage, vars, res, t0);
+      if (rwState === 'blocked') return;
+      if (rwState === 'back') { reworked = true; break; }
       const problems = verify(stage, vars, res);
       // Guard (2026-11-07): a build stage that changed nothing has not done its task, even if checks pass.
       if (mustChange(stage) && before !== null && treeSnapshot(workdir(vars)) === before) problems.push('no files changed in ' + workdir(vars) + ' (the task was not implemented)');
@@ -276,6 +324,7 @@ function advance(run) {
       }
       save(run);
     }
+    if (reworked) continue; // cursor already moved back to the build stage
     if (!done) {
       const isP = paused(stage.agent);
       run.status = isP ? 'paused' : 'blocked';
@@ -285,6 +334,7 @@ function advance(run) {
       console.log(run.status === 'blocked' ? `\n⛔ BLOCKED at ${stage.id}. See .studio/runs/${run.id}.json` : '\nPaused.');
       return;
     }
+    if (run.reworkNotes) delete run.reworkNotes[stage.id]; // note consumed by a successful build
     run.cursor++; save(run);
   }
   run.status = 'done'; save(run);
@@ -321,4 +371,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { parseRunOutput, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange };
+module.exports = { advance, hooks, parseRunOutput, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange };
