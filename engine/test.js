@@ -7,8 +7,9 @@ const path = require('path');
 
 const DIR = __dirname;
 const SUITES = [
-  { file: 'selftest.js',              label: 'parseRunOutput / verify' },
-  { file: 'selftest-team-lead.js',    label: 'resolveTeamLead' },
+  { file: 'selftest.js',                   label: 'parseRunOutput / verify / postmortem' },
+  { file: 'selftest-team-lead.js',         label: 'resolveTeamLead' },
+  { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
 ];
 
 let anyFailed = false;

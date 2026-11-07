@@ -92,7 +92,7 @@ function parseRunOutput(r) {
   return {
     turns: out.num_turns,
     result: String(out.result || '').slice(0, 2000),
-    error: (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype : null,
+    error: (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
     ignoredWarning: modelWarning ? stderr.slice(0, 300) : null,
     usage: out.usage ? { in: out.usage.input_tokens, out: out.usage.output_tokens, cached: out.usage.cache_read_input_tokens } : null,
     hitTurnCap: out.subtype === 'error_max_turns',
@@ -149,32 +149,126 @@ function verify(stage, vars, res) {
     const c = spawnSync(fill(stage.check, vars), { cwd: workdir(vars), shell: true, encoding: 'utf8', timeout: 600000 });
     if (c.status !== 0) problems.push(`check failed: ${fill(stage.check, vars)}\n${(c.stdout + c.stderr).slice(-1200)}`);
   }
+  // DoD: each heading must exist as a markdown heading (## ...) in the specified file.
+  for (const entry of stage.dod || []) {
+    const fpath = path.resolve(REPO, fill(entry.file, vars));
+    const content = fs.existsSync(fpath) ? fs.readFileSync(fpath, 'utf8') : null;
+    if (content === null) {
+      for (const h of entry.headings || []) problems.push(`dod missing heading "${h}" — file ${fill(entry.file, vars)} does not exist`);
+    } else {
+      for (const h of entry.headings || []) {
+        if (!new RegExp('^\\s*#{1,6}\\s+' + h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*$', 'mi').test(content)) {
+          problems.push(`dod missing heading "${h}" in ${fill(entry.file, vars)}`);
+        }
+      }
+    }
+  }
   return problems;
+}
+
+// Pre-check: verify all required input paths exist before a stage runs.
+// Returns an array of missing-path descriptions; empty array means all good.
+function checkRequires(stage, vars) {
+  const missing = [];
+  for (const r of stage.requires || []) {
+    const rp = fill(r, vars);
+    const p = path.resolve(REPO, rp);
+    if (!fs.existsSync(p)) missing.push(rp);
+  }
+  return missing;
 }
 
 // Resolve the build agent from the design.md "Team:" line.
 // Picks the first of frontend-dev, mobile-dev, backend-dev named in that line.
-// Returns "mobile-dev" if the file is missing or no role is found.
+// Falls back to "mobile-dev" if the file is missing, has no Team line, or
+// the Team line contains no build role — and emits a progress warning in those cases.
 // Accepts absolute paths or repo-relative paths (joined with REPO).
 function resolveTeamLead(designPath) {
 	const f = path.isAbsolute(designPath) ? designPath : path.join(REPO, designPath);
 	let txt = '';
 	try { txt = fs.readFileSync(f, 'utf8'); } catch {}
-	// Match "Team:" with optional leading list bullets, optional bold markdown, any case.
-	const teamRegex = /^[ \t]*[*\->]?\s*\*?Team\*?:/im;
+	// Match "Team:" with optional leading list bullets, optional bold markdown (* or **), any case.
+	const teamRegex = /^\s*(?:[-*>]\s*)?(?:\*{1,2})?team(?:\*{1,2})?\s*:/i;
 	const line = txt.split('\n').find((l) => teamRegex.test(l));
-	if (!line) return 'mobile-dev';
+	if (!line) {
+		console.warn('resolveTeamLead: no "Team:" line in', designPath, '— defaulting to mobile-dev');
+		ev({ type: 'progress', agent: 'engine', pct: 0, status: 'warning', message: `no Team: line in ${designPath}; defaulting to mobile-dev` });
+		return 'mobile-dev';
+	}
 	const candidates = ['frontend-dev', 'mobile-dev', 'backend-dev'];
 	for (const c of candidates) { if (line.includes(c)) return c; }
+	console.warn('resolveTeamLead: no build role on Team line in', designPath, '— defaulting to mobile-dev');
+	ev({ type: 'progress', agent: 'engine', pct: 0, status: 'warning', message: `no build role on Team line in ${designPath}; defaulting to mobile-dev` });
 	return 'mobile-dev';
 }
 
-// ---- the state machine ----
+// ---- postmortem stubs (S2) ----
+// When a run becomes blocked or an attempt escalates to sonnet/opus,
+// write docs/postmortems/<run-id>-<stage>.md with run history, tiers tried,
+// problems verbatim, time and token usage, plus empty Root cause / Fix / Prevent.
+function writePostmortem(run, stage) {
+  const dir = path.join(REPO, 'docs', 'postmortems');
+  const fname = `${run.id}-${stage.id}.md`;
+  const filePath = path.resolve(REPO, 'docs', 'postmortems', fname);
+  fs.mkdirSync(dir, { recursive: true });
+  const stageHistory = (run.history || []).filter((h) => h.stage === stage.id);
+  const tiersTried = [...new Set(stageHistory.map((h) => h.tier).filter(Boolean))];
+  let lines = [
+    `# Postmortem: ${run.id} → ${stage.id}`,
+    '',
+    `## What happened`,
+  ];
+  for (const h of stageHistory) {
+    lines.push(`- Attempt ${h.attempt} on ${h.tier} (${h.model}): ${h.ok ? 'ok' : 'failed'} in ${h.secs}s`);
+    if (h.turns != null) lines.push(`  turns: ${h.turns}`);
+    if (h.error) lines.push(`  error: ${h.error}`);
+  }
+  if (!stageHistory.length) lines.push('(no history yet)');
+  lines.push('');
+  lines.push(`## Tiers tried`);
+  lines.push(tiersTried.join(', ') || '(none)');
+  lines.push('');
+  lines.push(`## Problems`);
+  const problems = stageHistory.filter((h) => h.problems && h.problems.length).flatMap((h) => h.problems);
+  for (const p of problems) lines.push(`- ${p}`);
+  if (!problems.length) lines.push('(none)');
+  lines.push('');
+  lines.push(`## Time and Token Usage`);
+  const totalSecs = stageHistory.reduce((s, h) => s + (h.secs || 0), 0);
+  const totalIn = stageHistory.reduce((s, h) => s + (h.usage?.in || 0), 0);
+  const totalOut = stageHistory.reduce((s, h) => s + (h.usage?.out || 0), 0);
+  const totalCached = stageHistory.reduce((s, h) => s + (h.usage?.cached || 0), 0);
+  lines.push(`- Total time: ${totalSecs}s`);
+  lines.push(`- Tokens in: ${totalIn}, out: ${totalOut}, cached: ${totalCached}`);
+  lines.push('');
+  lines.push(`## Root cause`);
+  lines.push('');
+  lines.push(`## Fix`);
+  lines.push('');
+  lines.push(`## Prevent`);
+  lines.push('');
+  fs.writeFileSync(filePath, lines.join('\n'));
+  ev({ type: 'progress', agent: 'engine', pct: 0, status: 'postmortem', message: `Postmortem stub: ${filePath}` });
+  return filePath;
+}
 function advance(run) {
   while (run.cursor < run.stages.length) {
     if (paused(run.stages[run.cursor] && run.stages[run.cursor].agent)) { run.status = 'paused'; save(run); console.log('Studio is paused (safe stop). Resume with the switch, then: engine.js resume ' + run.id); return; }
     const stage = run.stages[run.cursor];
     const vars = run.vars;
+
+    // requires: pre-check paths BEFORE any stage runs; missing → blocked, no model call.
+    if (stage.type !== 'gate') {
+      const missingReqs = checkRequires(stage, vars);
+      if (missingReqs.length) {
+        run.status = 'blocked';
+        run.blockedReason = `stage ${stage.id}: requires missing — ${missingReqs.join(', ')}`;
+        writePostmortem(run, stage);
+        save(run);
+        console.log(`\n⛔ BLOCKED at ${stage.id}: required path(s) missing: ${missingReqs.join(', ')}`);
+        return;
+      }
+    }
 
     if (stage.type === 'gate') {
       const g = run.gates[stage.id];
@@ -193,7 +287,7 @@ function advance(run) {
     if (stage.type === 'script') {
       const c = spawnSync(fill(stage.run, vars), { cwd: workdir(vars), shell: true, encoding: 'utf8' });
       run.history.push({ stage: stage.id, type: 'script', ok: c.status === 0, at: now(), out: (c.stdout + c.stderr).slice(-500) });
-      if (c.status !== 0) { run.status = 'blocked'; run.blockedReason = `script ${stage.id} failed`; save(run); return; }
+      if (c.status !== 0) { run.status = 'blocked'; run.blockedReason = `script ${stage.id} failed`; writePostmortem(run, stage); save(run); return; }
       run.cursor++; save(run); continue;
     }
 
@@ -201,7 +295,7 @@ function advance(run) {
       const src = fs.existsSync(path.resolve(REPO, fill(stage.items.file, vars))) ? fs.readFileSync(path.resolve(REPO, fill(stage.items.file, vars)), 'utf8') : '';
       // Each match gives {{item}} (group 1 or whole match) plus {{g1}}, {{g2}}… for every capture group.
       const items = [...src.matchAll(new RegExp(stage.items.regex, 'gm'))].map((m) => ({ item: (m[1] || m[0]).trim(), ...Object.fromEntries(m.slice(1).map((g, j) => [`g${j + 1}`, (g || '').trim()])) }));
-      if (!items.length) { run.status = 'blocked'; run.blockedReason = `foreach ${stage.id}: no items found in ${stage.items.file}`; save(run); return; }
+      if (!items.length) { run.status = 'blocked'; run.blockedReason = `foreach ${stage.id}: no items found in ${stage.items.file}`; writePostmortem(run, stage); save(run); return; }
       const esc = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, JSON.stringify(v).slice(1, -1)])); // safe inside JSON strings
       const expanded = items.flatMap((it, i) => stage.stages.map((s) => JSON.parse(fill(JSON.stringify({ ...s, id: `${s.id}#${i + 1}` }), { ...vars, ...esc(it), n: i + 1 }))));
       run.stages.splice(run.cursor, 1, ...expanded); save(run); continue;
@@ -212,7 +306,7 @@ function advance(run) {
     // Uses stage.designDoc if provided (pipeline-level override), otherwise falls back
     // to the conventional docs/specs/{{slug}}.design.md path.
     if (stage.agent === '__team_lead__') {
-      const designPath = fill(stage.designDoc || '{{slug}}.design.md', vars);
+      const designPath = fill(stage.designDoc || 'docs/specs/{{slug}}.design.md', vars);
       stage.agent = resolveTeamLead(designPath);
     }
     const ladder = LADDER[stage.tier || 'local'];
@@ -220,6 +314,7 @@ function advance(run) {
     for (let attempt = 0; attempt < ladder.length && !done; attempt++) {
       const tierName = ladder[attempt];
       if (paused(stage.agent)) break;
+      if (['sonnet', 'opus'].includes(tierName)) writePostmortem(run, stage);
       ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const res = runAgent(stage, tierName, vars, feedback);
@@ -241,6 +336,7 @@ function advance(run) {
       const isP = paused(stage.agent);
       run.status = isP ? 'paused' : 'blocked';
       run.blockedReason = isP ? 'paused' : `${stage.id} failed on every tier: ${feedback}`;
+      if (!isP) writePostmortem(run, stage);
       save(run);
       if (!isP) ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. Needs owner or Claude help.` });
       console.log(run.status === 'blocked' ? `\n⛔ BLOCKED at ${stage.id}. See .studio/runs/${run.id}.json` : '\nPaused.');
@@ -282,4 +378,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { parseRunOutput, verify, resolveTeamLead };
+module.exports = { parseRunOutput, verify, resolveTeamLead, writePostmortem, checkRequires, fill, REPO };

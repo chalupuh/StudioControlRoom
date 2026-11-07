@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { resolveTeamLead } = require('./engine');
+const { resolveTeamLead, REPO } = require('./engine');
 
 const TEST_DIR = path.join(os.tmpdir(), 'studio-selftest-team-lead');
 
@@ -108,6 +108,17 @@ const tests = [
     fileName: 'test-slug.design.md',
     expect: 'backend-dev',
   },
+  // --- Regex: bold bullet variants (S3) ---
+  {
+    name: '- **Team:** bold bullet',
+    content: '# Design\n- **Team:** frontend-dev, qa-engineer\n## Milestone 1\nstuff',
+    expect: 'frontend-dev',
+  },
+  {
+    name: '**Team**: colon outside bold',
+    content: '# Design\n**Team**: mobile-dev, qa-engineer\n## Milestone 1\nstuff',
+    expect: 'mobile-dev',
+  },
 ];
 
 // Setup
@@ -135,8 +146,29 @@ for (const t of tests) {
   else { failed++; console.log(`  ✗ ${t.name}: expected "${t.expect}", got "${got}"`); }
 }
 
-// Cleanup
+// Cleanup temp dir
 try { fs.rmSync(TEST_DIR, { recursive: true }); } catch {}
 
-console.log(`\n${passed}/${tests.length} passed${failed ? ` (${failed} failed)` : ''}`);
+// ---- S4: repo-relative designDoc path ----
+// Write a file under REPO/docs/specs/, call resolveTeamLead with a relative path, clean up.
+{
+  const selftestFile = `__selftest-${process.pid}.design.md`;
+  const selftestPath = 'docs/specs/' + selftestFile;
+  const absPath = path.join(REPO, 'docs', 'specs', selftestFile);
+  try {
+    fs.mkdirSync(path.join(REPO, 'docs', 'specs'), { recursive: true });
+    fs.writeFileSync(absPath, '# Design\nTeam: backend-dev\n');
+    const got = resolveTeamLead(selftestPath);
+    if (got === 'backend-dev') { passed++; console.log(`  ✓ repo-relative path resolves correctly`); }
+    else { failed++; console.log(`  ✗ repo-relative path: expected "backend-dev", got "${got}"`); }
+  } catch (e) {
+    failed++;
+    console.log(`  ✗ repo-relative path: threw ${e.message}`);
+  } finally {
+    try { fs.unlinkSync(absPath); } catch {}
+  }
+}
+
+const total = tests.length + 1; // +1 for S4
+console.log(`\n${passed}/${total} passed${failed ? ` (${failed} failed)` : ''}`);
 process.exit(failed > 0 ? 1 : 0);

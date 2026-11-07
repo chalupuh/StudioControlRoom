@@ -3,6 +3,8 @@
 // Run: node tools/engine/selftest.js
 
 const { parseRunOutput } = require('./engine');
+const path = require('path');
+const fs = require('fs');
 
 let pass = 0, fail = 0;
 function assert(name, cond) {
@@ -11,6 +13,7 @@ function assert(name, cond) {
 }
 
 const jsonLine = (obj) => JSON.stringify(obj);
+const now = () => new Date().toISOString();
 
 // ---- Test 1: clean success ----
 {
@@ -186,6 +189,43 @@ const jsonLine = (obj) => JSON.stringify(obj);
   assert('timeout → ignoredWarning is null', r.ignoredWarning === null);
 }
 
+// ---- Test 15b: timeout with empty stderr, no subtype → error is non-empty string (S2) ----
+// spawnSync timeout with r.error ETIMEDOUT and no stderr/subtype must produce a real error string.
+{
+  const r = parseRunOutput({
+    status: null,
+    signal: 'SIGTERM',
+    error: { code: 'ETIMEDOUT' },
+    stdout: '',
+    stderr: '',
+  });
+  assert('timeout empty stderr no subtype → error is non-empty string', typeof r.error === 'string' && r.error.length > 0);
+  assert('timeout empty stderr → error includes ETIMEDOUT', r.error.includes('ETIMEDOUT'));
+}
+
+// ---- Test 15c: spawn error ENOENT, empty stderr → error is non-empty string (S2) ----
+{
+  const r = parseRunOutput({
+    status: null,
+    error: { code: 'ENOENT' },
+    stdout: '',
+    stderr: '',
+  });
+  assert('ENOENT empty stderr → error is non-empty string', typeof r.error === 'string' && r.error.length > 0);
+  assert('ENOENT empty stderr → error includes ENOENT', r.error.includes('ENOENT'));
+}
+
+// ---- Test 15d: failure with only non-zero status, no stderr/subtype → error mentions exit code (S2) ----
+{
+  const r = parseRunOutput({
+    status: 42,
+    stdout: jsonLine({ num_turns: 0, is_error: true }),
+    stderr: '',
+  });
+  assert('non-zero status no stderr → error is non-empty string', typeof r.error === 'string' && r.error.length > 0);
+  assert('non-zero status no stderr → error mentions exit 42', r.error.includes('exit 42'));
+}
+
 // ---- Test 16: direct verify() test — empty result triggers "empty final answer" ----
 {
   const { verify } = require('./engine');
@@ -214,6 +254,47 @@ const jsonLine = (obj) => JSON.stringify(obj);
   const problems3 = verify({ type: 'agent', id: 'test', expect: [] }, {}, resWarnEmpty);
   assert('verify() with ignoredWarning + empty result → empty final answer still reported',
     problems3.some((p) => p === 'empty final answer'));
+}
+
+// ---- Postmortem selftest ----
+{
+  const { writePostmortem } = require('./engine');
+  const os = require('os');
+  const tmpStudio = path.join(os.tmpdir(), `studio-postmortem-${process.pid}-${Date.now()}`);
+  const oldHome = process.env.STUDIO_HOME;
+  process.env.STUDIO_HOME = tmpStudio;
+  // Re-require engine with new STUDIO_HOME so REPO points to our temp dir
+  delete require.cache[require.resolve('./engine')];
+  const { writePostmortem: write, REPO: tmpREPO } = require('./engine');
+  const runId = `postmortem-test-${process.pid}`;
+  const stageId = 'test-stage';
+  const fakeRun = {
+    id: runId,
+    history: [
+      { stage: stageId, agent: 'backend-dev', attempt: 1, tier: 'local', model: 'qwen3.6:27b', ok: false, error: 'timeout', problems: ['check failed: lint'], secs: 45, turns: 10, usage: { in: 1000, out: 500, cached: 200 }, at: now() },
+      { stage: stageId, agent: 'backend-dev', attempt: 2, tier: 'sonnet', model: 'sonnet', ok: false, error: 'api error', problems: ['run error: connection refused'], secs: 30, turns: 5, usage: { in: 800, out: 400, cached: 0 }, at: now() },
+    ],
+  };
+  const stage = { id: stageId };
+  const fp = write(fakeRun, stage);
+  assert('postmortem file created at correct path', fp.includes(runId) && fp.includes(stageId) && (fp.includes('docs/postmortems') || fp.includes('docs\\postmortems')));
+  assert('postmortem file exists on disk', fs.existsSync(fp));
+  const content = fs.readFileSync(fp, 'utf8');
+  assert('postmortem contains "What happened"', content.includes('## What happened'));
+  assert('postmortem lists tiers tried', content.includes('## Tiers tried'));
+  assert('postmortem lists problems', content.includes('## Problems'));
+  assert('postmortem contains "check failed: lint"', content.includes('check failed: lint'));
+  assert('postmortem contains "run error: connection refused"', content.includes('run error: connection refused'));
+  assert('postmortem has time/token section', content.includes('## Time and Token Usage'));
+  assert('postmortem has token totals (1800 in, 900 out, 200 cached)', content.includes('1800') && content.includes('900') && content.includes('200'));
+  assert('postmortem has empty "Root cause" section', content.includes('## Root cause'));
+  assert('postmortem has empty "Fix" section', content.includes('## Fix'));
+  assert('postmortem has empty "Prevent" section', content.includes('## Prevent'));
+  // Cleanup temp studio home
+  process.env.STUDIO_HOME = oldHome;
+  try { fs.rmSync(tmpStudio, { recursive: true }); } catch {}
+  // Restore cached engine module
+  delete require.cache[require.resolve('./engine')];
 }
 
 // ---- Summary ----
