@@ -66,7 +66,7 @@ function claudeExe() {
 
 function fill(tpl, vars) {
   return String(tpl || '')
-    .replace(/\{\{file:([^}]+)\}\}/g, (_, f) => { const p = path.join(REPO, fill(f, vars)); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : `(missing: ${f})`; })
+    .replace(/\{\{file:([^}]+)\}\}/g, (_, f) => { const p = path.resolve(REPO, fill(f, vars)); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : `(missing: ${f})`; })
     .replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] ?? `{{${k}}}`));
 }
 
@@ -142,7 +142,7 @@ function verify(stage, vars, res) {
   if (res.hitTurnCap) problems.push(`hit the ${stage.maxTurns || 25}-turn cap (likely stuck)`);
   if (!res.result.trim()) problems.push('empty final answer');
   for (const e of stage.expect || []) {
-    const p = path.join(REPO, fill(e, vars));
+    const p = path.resolve(REPO, fill(e, vars));
     if (!fs.existsSync(p) || !fs.statSync(p).size) problems.push(`missing or empty: ${fill(e, vars)}`);
   }
   if (stage.check) {
@@ -198,7 +198,7 @@ function advance(run) {
     }
 
     if (stage.type === 'foreach') {
-      const src = fs.existsSync(path.join(REPO, fill(stage.items.file, vars))) ? fs.readFileSync(path.join(REPO, fill(stage.items.file, vars)), 'utf8') : '';
+      const src = fs.existsSync(path.resolve(REPO, fill(stage.items.file, vars))) ? fs.readFileSync(path.resolve(REPO, fill(stage.items.file, vars)), 'utf8') : '';
       // Each match gives {{item}} (group 1 or whole match) plus {{g1}}, {{g2}}… for every capture group.
       const items = [...src.matchAll(new RegExp(stage.items.regex, 'gm'))].map((m) => ({ item: (m[1] || m[0]).trim(), ...Object.fromEntries(m.slice(1).map((g, j) => [`g${j + 1}`, (g || '').trim()])) }));
       if (!items.length) { run.status = 'blocked'; run.blockedReason = `foreach ${stage.id}: no items found in ${stage.items.file}`; save(run); return; }
@@ -262,7 +262,7 @@ if (require.main === module) {
 		const name = rest[0];
 		const pipe = JSON.parse(fs.readFileSync(path.join(PIPES, name + '.json'), 'utf8'));
 		const id = `${name}-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${Math.random().toString(36).slice(2, 5)}`;
-		const run = { id, pipeline: name, vars: { date: new Date().toISOString().slice(0, 10), soft: path.resolve(__dirname, '..'), ...pipe.defaults, ...vars }, stages: pipe.stages, cursor: 0, gates: {}, history: [], status: 'running', created: now() };
+		const run = { id, pipeline: name, vars: { date: new Date().toISOString().slice(0, 10), soft: path.resolve(__dirname, '..'), home: REPO, ...pipe.defaults, ...vars }, stages: pipe.stages, cursor: 0, gates: {}, history: [], status: 'running', created: now() };
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
 		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
 	} else if (cmd === 'resume') {
