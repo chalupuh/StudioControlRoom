@@ -202,8 +202,8 @@ function advance(run) {
       // Each match gives {{item}} (group 1 or whole match) plus {{g1}}, {{g2}}… for every capture group.
       const items = [...src.matchAll(new RegExp(stage.items.regex, 'gm'))].map((m) => ({ item: (m[1] || m[0]).trim(), ...Object.fromEntries(m.slice(1).map((g, j) => [`g${j + 1}`, (g || '').trim()])) }));
       if (!items.length) { run.status = 'blocked'; run.blockedReason = `foreach ${stage.id}: no items found in ${stage.items.file}`; save(run); return; }
-      const esc = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, JSON.stringify(v).slice(1, -1)])); // safe inside JSON strings
-      const expanded = items.flatMap((it, i) => stage.stages.map((s) => JSON.parse(fill(JSON.stringify({ ...s, id: `${s.id}#${i + 1}` }), { ...vars, ...esc(it), n: i + 1 }))));
+      const esc = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, JSON.stringify(String(v ?? '')).slice(1, -1)])); // safe inside JSON strings
+      const expanded = items.flatMap((it, i) => stage.stages.map((s) => JSON.parse(fill(JSON.stringify({ ...s, id: `${s.id}#${i + 1}` }), { ...esc(vars), ...esc(it), n: i + 1 }))));
       run.stages.splice(run.cursor, 1, ...expanded); save(run); continue;
     }
 
