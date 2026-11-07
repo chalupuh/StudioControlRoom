@@ -11,6 +11,7 @@ const SUITES = [
   { file: 'selftest-team-lead.js',    label: 'resolveTeamLead' },
   { file: 'selftest-foreach.js',      label: 'foreach expansion (Windows paths)' },
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
+  { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
 ];
 
 let anyFailed = false;
