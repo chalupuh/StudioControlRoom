@@ -80,6 +80,7 @@ export interface StudioState {
 // POST /api/runs/:runId/resume    -> {ok:true}
 // GET  /api/file?path=<repo-relative .md>  -> text/plain (only docs/**, .studio/checkpoints/** ; for gate review)
 // GET  /portraits/<file>          -> image
+// POST /api/shutdown             -> {ok, message}  one-shot Game mode (agents checkpoint, Ollama + ComfyUI + server stop)
 // GET  /v1                        -> legacy dashboard.html
 
 export const api = {
@@ -91,5 +92,6 @@ export const api = {
     fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, team }) }).then((r) => r.json()),
   gate: (runId: string, decision: 'approve' | 'reject', note = '') =>
     fetch('/api/gates/' + encodeURIComponent(runId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, note }) }).then((r) => r.json()),
+  shutdown: (): Promise<{ ok: boolean; message: string }> => fetch('/api/shutdown', { method: 'POST' }).then((r) => r.json()),
   resume: (runId: string) => fetch('/api/runs/' + encodeURIComponent(runId) + '/resume', { method: 'POST' }).then((r) => r.json()),
 };
