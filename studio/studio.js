@@ -7,6 +7,7 @@
 //   node .studio/studio.js pause | resume | status        <- safe stop / start switch
 //   node .studio/studio.js checkpoint <agent> "<where>" "<next>" ["<files>"]
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
+//   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -376,6 +377,12 @@ function serve(port = 4777) {
       req.on('close', () => clients.delete(res));
       return;
     }
+    if (p === '/api/shutdown' && m === 'POST') {
+      // One-shot Game mode: run in a detached process so it can also stop this server at the end.
+      const out = fs.openSync(path.join(DIR, 'shutdown.log'), 'a');
+      require('child_process').spawn(process.execPath, [path.join(SOFT, 'studio.js'), 'shutdown'], { detached: true, windowsHide: true, stdio: ['ignore', out, out] }).unref();
+      return json(res, { ok: true, message: 'Shutting down: agents checkpoint, local models and ComfyUI stop, then this server stops.' });
+    }
     if (p === '/api/control' && m === 'POST') {
       const b = await readBody(req);
       if (b.action !== 'pause' && b.action !== 'resume') return json(res, { error: 'action must be pause or resume' }, 400);
@@ -437,7 +444,7 @@ function serve(port = 4777) {
 
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, '127.0.0.1', () => console.log(`Studio dashboard: http://localhost:${port}`));
+  }).listen(port, '127.0.0.1', () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -449,5 +456,7 @@ else if (cmd === 'status') { console.log(getControl()); for (const c of listChec
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
 else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
+else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
+else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup');
