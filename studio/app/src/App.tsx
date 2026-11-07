@@ -14,6 +14,12 @@ export default function App() {
   const studio = useStudio();
   const { state, online } = studio;
   const [tab, setTab] = useState<'org' | 'village' | 'ops'>('org');
+  const [gameMode, setGameMode] = useState(false);
+  const shutdown = async () => {
+    if (!confirm('Game mode: save checkpoints, stop ALL local models, ComfyUI and this Control Room to free the GPU?\n\nBring it back later with Studio-Start.cmd.')) return;
+    await api.shutdown().catch(() => {});
+    setGameMode(true);
+  };
   const paused = state?.control.state === 'paused';
   const waiting = state?.runs.filter((r) => r.status === 'waiting-gate' || r.status === 'blocked').length || 0;
 
@@ -35,10 +41,12 @@ export default function App() {
             Operations {waiting > 0 && <b className="badge">{waiting}</b>}
           </button>
         </nav>
+        <button className="power" onClick={shutdown} title="One-shot shutdown: frees the GPU for gaming">⏻ Game mode</button>
         <button className={'switch ' + (paused ? 'off' : 'on')} onClick={toggle} aria-pressed={!paused}>
           <span className="track"><span className="knob" /></span>{paused ? 'Paused' : 'Running'}
         </button>
       </header>
+      {gameMode && <div className="banner">Game mode: agents are checkpointing; local models, ComfyUI and this server are shutting down. The GPU will be free in about a minute. Start again with <b>Studio-Start.cmd</b> in the StudioControlRoom folder.</div>}
       {paused && <div className="banner">Studio paused. Agents are saving checkpoints. Flip the switch to resume.</div>}
       <main>
         {!state ? <div className="loading">Connecting to studio…</div>
