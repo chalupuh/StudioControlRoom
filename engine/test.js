@@ -7,11 +7,12 @@ const path = require('path');
 
 const DIR = __dirname;
 const SUITES = [
-  { file: 'selftest.js',              label: 'parseRunOutput / verify' },
+  { file: 'selftest.js',              label: 'parseRunOutput / verify / postmortem' },
   { file: 'selftest-team-lead.js',    label: 'resolveTeamLead' },
   { file: 'selftest-foreach.js',      label: 'foreach expansion (Windows paths)' },
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
+  { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
 ];
 
 let anyFailed = false;
