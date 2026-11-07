@@ -99,7 +99,7 @@ function startup(ctx) {
     // Start the Ollama *server* headless (the tray app doesn't reliably start it and isn't needed).
     const exe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe');
     if (fs.existsSync(exe) && !studioProcesses().some((p) => p.name === 'ollama.exe')) {
-      const env = { OLLAMA_KEEP_ALIVE: '5m', OLLAMA_HOST: '127.0.0.1:11434', ...process.env };
+      const env = { OLLAMA_KEEP_ALIVE: '5m', OLLAMA_HOST: '127.0.0.1:11434', OLLAMA_NUM_PARALLEL: '4', ...process.env };
       spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true, env }).unref(); log('• Ollama server started (headless)');
     } else log('• Ollama already running (or not installed)');
   }
