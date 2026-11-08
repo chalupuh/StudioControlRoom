@@ -57,6 +57,7 @@ export interface Gpu {
   gpus: { name: string; memUsedMB: number; memTotalMB: number; utilPct: number; tempC: number }[];
   ollama: { name: string; vramMB: number; until?: string }[];  // models loaded right now
   comfy: { up: boolean; queueRunning: number; queuePending: number };
+  slots?: { llm: { used: number; max: number; model: string }; creative: { running: boolean; queued: number } };
 }
 
 /** GET /api/state: one snapshot of everything. */

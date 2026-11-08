@@ -12,10 +12,12 @@
 //   agent   { id, agent, tier: local|local-fast|sonnet|opus, task, expect:[paths], check:"cmd", maxTurns }
 //   gate    { id, title, show:[paths] }            stops until the owner approves
 //   script  { id, run:"cmd" }                       deterministic step, no model
+//   any agent/script stage may set "gpu":"creative" to hold the exclusive GPU slot (engine/gpu.js)
 //   foreach { id, items:{ file, regex }, stages:[...] }  repeats sub-stages per match ({{item}})
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { acquire: gpuAcquire, release: gpuRelease } = require('./gpu');
 
 // REPO = the org workspace (STUDIO_HOME): agents, docs, pipelines, runtime data. The engine itself may live
 // elsewhere (StudioControlRoom). Resolution: STUDIO_HOME env → studio.home.json at the software root → legacy.
@@ -169,8 +171,31 @@ function resolveTeamLead(designPath) {
 	return 'mobile-dev';
 }
 
+// ---- GPU slots (engine/gpu.js) ----
+// Local attempts take an 'llm' slot, "gpu":"creative" stages the exclusive slot; cloud tiers never wait.
+// While blocked we poll and emit one 'progress' event "waiting for GPU".
+const GPU_WAIT_MS = Number(process.env.STUDIO_GPU_WAIT_MS) || 30 * 60000;
+const GPU_RETRY_MS = Number(process.env.STUDIO_GPU_RETRY_MS) || 5000;
+const impl = { runAgent: (...a) => runAgent(...a) }; // seam for tests
+async function withGpu(kind, stage, run, fn) {
+  if (!kind) return fn();
+  const deadline = Date.now() + GPU_WAIT_MS;
+  let token, announced = false;
+  for (;;) {
+    try { token = await gpuAcquire(kind, { stage: stage.id, agent: stage.agent, run: run.id }); break; }
+    catch (e) {
+      if (!/^blocked:|no llm slots|timed out/.test(e.message) || Date.now() >= deadline) throw e;
+      if (!announced) { announced = true; ev({ type: 'progress', agent: stage.agent || 'manager', pct: 0, status: 'working', message: `${stage.id}: waiting for GPU (${kind})` }); console.log(`  [gpu] waiting for GPU (${kind})`); }
+      await new Promise((r) => setTimeout(r, GPU_RETRY_MS));
+    }
+  }
+  try { return await fn(); } finally { try { gpuRelease(token); } catch (e) { console.warn(`  [gpu] release warn: ${e.message}`); } }
+}
+// creative-marked stages always take the exclusive slot; otherwise only local tiers take an llm slot.
+const gpuKind = (stage, tierName) => stage.gpu === 'creative' ? 'creative' : (tierName && TIERS[tierName].local ? 'llm' : null);
+
 // ---- the state machine ----
-function advance(run) {
+async function advance(run) {
   while (run.cursor < run.stages.length) {
     if (paused(run.stages[run.cursor] && run.stages[run.cursor].agent)) { run.status = 'paused'; save(run); console.log('Studio is paused (safe stop). Resume with the switch, then: engine.js resume ' + run.id); return; }
     const stage = run.stages[run.cursor];
@@ -191,7 +216,7 @@ function advance(run) {
     }
 
     if (stage.type === 'script') {
-      const c = spawnSync(fill(stage.run, vars), { cwd: workdir(vars), shell: true, encoding: 'utf8' });
+      const c = await withGpu(gpuKind(stage), stage, run, () => spawnSync(fill(stage.run, vars), { cwd: workdir(vars), shell: true, encoding: 'utf8' }));
       run.history.push({ stage: stage.id, type: 'script', ok: c.status === 0, at: now(), out: (c.stdout + c.stderr).slice(-500) });
       if (c.status !== 0) { run.status = 'blocked'; run.blockedReason = `script ${stage.id} failed`; save(run); return; }
       run.cursor++; save(run); continue;
@@ -222,7 +247,7 @@ function advance(run) {
       if (paused(stage.agent)) break;
       ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
-      const res = runAgent(stage, tierName, vars, feedback);
+      const res = await withGpu(gpuKind(stage, tierName), stage, run, () => impl.runAgent(stage, tierName, vars, feedback));
       const problems = verify(stage, vars, res);
       run.history.push({ stage: stage.id, agent: stage.agent, attempt: attempt + 1, ...res, ok: !problems.length, problems, at: now() });
       ev({ type: 'usage', agent: stage.agent, tier: tierName, model: res.model, cloud: res.cloud, tokensIn: res.usage?.in || 0, tokensOut: res.usage?.out || 0, secs: res.secs });
@@ -254,7 +279,7 @@ function advance(run) {
 }
 
 // ---- CLI ----
-if (require.main === module) {
+if (require.main === module) (async () => {
 	const [cmd, ...rest] = process.argv.slice(2);
 	const vars = {}; for (let i = 0; i < rest.length; i++) if (rest[i] === '--var') { const [k, ...v] = rest[++i].split('='); vars[k] = v.join('='); }
 
@@ -264,22 +289,22 @@ if (require.main === module) {
 		const id = `${name}-${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}-${Math.random().toString(36).slice(2, 5)}`;
 		const run = { id, pipeline: name, vars: { date: new Date().toISOString().slice(0, 10), soft: path.resolve(__dirname, '..'), home: REPO, ...pipe.defaults, ...vars }, stages: pipe.stages, cursor: 0, gates: {}, history: [], status: 'running', created: now() };
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
-		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
+		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); await advance(run);
 	} else if (cmd === 'resume') {
-		const run = load(rest[0]); run.status = 'running'; save(run); advance(run);
+		const run = load(rest[0]); run.status = 'running'; save(run); await advance(run);
 	} else if (cmd === 'approve') {
 		const run = load(rest[0]); const decision = rest[1] || 'approve';
 		const gid = Object.keys(run.gates).find((k) => run.gates[k].status === 'waiting');
 		if (!gid) { console.log('No gate is waiting.'); process.exit(0); }
 		Object.assign(run.gates[gid], { status: decision === 'reject' ? 'rejected' : 'approved', note: rest[2] || '', decided: now() });
 		ev({ type: 'progress', agent: 'owner', pct: 100, status: 'done', message: `Gate ${gid}: ${run.gates[gid].status}${rest[2] ? ' (' + rest[2] + ')' : ''}` });
-		save(run); console.log(`Gate ${gid} ${run.gates[gid].status}.`); if (decision !== 'reject') advance(run); else { run.status = 'stopped'; save(run); }
+		save(run); console.log(`Gate ${gid} ${run.gates[gid].status}.`); if (decision !== 'reject') await advance(run); else { run.status = 'stopped'; save(run); }
 	} else if (cmd === 'status') {
 		if (rest[0]) { const r = load(rest[0]); console.log(JSON.stringify({ ...r, stages: r.stages.map((s, i) => `${i === r.cursor ? '→ ' : '  '}${s.id}`) }, null, 2)); }
 		else if (fs.existsSync(RUNS)) for (const f of fs.readdirSync(RUNS).filter((f) => f.endsWith('.json'))) { const r = load(f.replace('.json', '')); console.log(`${r.id.padEnd(40)} ${r.status.padEnd(13)} at ${r.stages[r.cursor]?.id || '(end)'}`); }
 	} else if (cmd === 'pipelines') {
 		for (const f of fs.readdirSync(PIPES)) { const p = JSON.parse(fs.readFileSync(path.join(PIPES, f), 'utf8')); console.log(`${f.replace('.json', '').padEnd(14)} ${p.description}  [vars: ${(p.required || []).join(', ')}]`); }
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
-}
+})().catch((e) => { console.error(e); process.exit(1); });
 
-module.exports = { parseRunOutput, verify, resolveTeamLead };
+module.exports = { parseRunOutput, verify, resolveTeamLead, advance, withGpu, gpuKind, impl };

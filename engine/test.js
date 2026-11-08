@@ -9,6 +9,8 @@ const DIR = __dirname;
 const SUITES = [
   { file: 'selftest.js',              label: 'parseRunOutput / verify' },
   { file: 'selftest-team-lead.js',    label: 'resolveTeamLead' },
+  { file: 'selftest-gpu.js',          label: 'GPU slot scheduler' },
+  { file: 'selftest-integration-gpu.js', label: 'engine <-> GPU wiring' },
 ];
 
 let anyFailed = false;

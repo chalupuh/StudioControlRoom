@@ -247,6 +247,9 @@ function getUsage() {
 }
 
 // ---- GPU / Ollama / ComfyUI (cached 2 s, never throws) ----
+// Optional: GPU slot scheduler from engine/gpu.js
+let gpuEngine = null;
+try { gpuEngine = require('../engine/gpu.js'); } catch { /* engine/gpu.js may not exist */ }
 let gpuCache = { at: 0, val: null, pending: null };
 const fetchJson = async (url) => { const r = await fetch(url, { signal: AbortSignal.timeout(1500) }); if (!r.ok) throw new Error(String(r.status)); return r.json(); };
 function nvidia() {
@@ -262,12 +265,13 @@ function nvidia() {
   });
 }
 async function computeGpu() {
-  const [gpus, ollama, comfy] = await Promise.all([
+  const [gpus, ollama, comfy, slots] = await Promise.all([
     nvidia().catch(() => []),
     fetchJson('http://127.0.0.1:11434/api/ps').then((j) => (j.models || []).map((m) => ({ name: m.name || m.model, vramMB: Math.round((m.size_vram || 0) / 1048576), until: m.expires_at }))).catch(() => []),
     fetchJson('http://127.0.0.1:8188/queue').then((j) => ({ up: true, queueRunning: (j.queue_running || []).length, queuePending: (j.queue_pending || []).length })).catch(() => ({ up: false, queueRunning: 0, queuePending: 0 })),
+    Promise.resolve().then(() => gpuEngine && gpuEngine.status ? gpuEngine.status() : undefined).catch(() => undefined),
   ]);
-  return { gpus, ollama, comfy };
+  return { gpus, ollama, comfy, slots };
 }
 async function getGpu() {
   if (gpuCache.val && Date.now() - gpuCache.at < 2000) return gpuCache.val;
