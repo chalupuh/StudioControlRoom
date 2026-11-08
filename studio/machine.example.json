@@ -1,0 +1,20 @@
+{
+  "profiles": {
+    "goldg-5090": {
+      "name": "goldg-5090",
+      "gitBash": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "ollama": { "url": "http://127.0.0.1:11434", "numParallel": 4, "keepAlive": "5m", "contextLength": null },
+      "comfyUrl": "http://127.0.0.1:8188",
+      "gpu": { "vramGB": 32, "llmModel": "qwen3.6:27b", "llmSlots": 3 },
+      "controlRoom": { "port": 4777, "bind": "127.0.0.1" }
+    },
+    "bld-3090": {
+      "name": "bld-3090",
+      "gitBash": "C:\\Program Files\\Git\\bin\\bash.exe",
+      "ollama": { "url": "http://127.0.0.1:11434", "numParallel": 2, "keepAlive": "5m", "contextLength": 32768 },
+      "comfyUrl": "http://127.0.0.1:8188",
+      "gpu": { "vramGB": 24, "llmModel": "qwen3.6:27b", "llmSlots": 2 },
+      "controlRoom": { "port": 4777, "bind": "127.0.0.1" }
+    }
+  }
+}

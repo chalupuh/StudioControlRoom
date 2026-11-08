@@ -7,7 +7,8 @@
 //   node .studio/studio.js pause | resume | status        <- safe stop / start switch
 //   node .studio/studio.js checkpoint <agent> "<where>" "<next>" ["<files>"]
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
-//   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
+//   node studio/studio.js supervise                       <- long-running: keep services up, resume paused/running runs (60 s)
+//   node studio/studio.js shutdown | startup              <- Game mode: one-shot total shutdown / bring back
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -23,6 +24,8 @@ function studioHome() {
 }
 const HOME = studioHome();
 const DIR = path.join(HOME, '.studio');
+const machineLib = require('./machine');
+const MACHINE = machineLib.load(HOME); // per-machine profile (HOME/.studio/machine.json)
 const LOG = path.join(DIR, 'events.jsonl');
 
 function append(ev) {
@@ -265,8 +268,8 @@ function nvidia() {
 async function computeGpu() {
   const [gpus, ollama, comfy] = await Promise.all([
     nvidia().catch(() => []),
-    fetchJson('http://127.0.0.1:11434/api/ps').then((j) => (j.models || []).map((m) => ({ name: m.name || m.model, vramMB: Math.round((m.size_vram || 0) / 1048576), until: m.expires_at }))).catch(() => []),
-    fetchJson('http://127.0.0.1:8188/queue').then((j) => ({ up: true, queueRunning: (j.queue_running || []).length, queuePending: (j.queue_pending || []).length })).catch(() => ({ up: false, queueRunning: 0, queuePending: 0 })),
+    fetchJson(machineLib.ollamaUrl(MACHINE) + '/api/ps').then((j) => (j.models || []).map((m) => ({ name: m.name || m.model, vramMB: Math.round((m.size_vram || 0) / 1048576), until: m.expires_at }))).catch(() => []),
+    fetchJson(MACHINE.comfyUrl.replace(/\/+$/, '') + '/queue').then((j) => ({ up: true, queueRunning: (j.queue_running || []).length, queuePending: (j.queue_pending || []).length })).catch(() => ({ up: false, queueRunning: 0, queuePending: 0 })),
   ]);
   return { gpus, ollama, comfy };
 }
@@ -341,7 +344,7 @@ function spawnEngine(args, runId) {
   fs.closeSync(out);
 }
 
-function serve(port = 4777) {
+function serve(port = MACHINE.controlRoom.port) {
   const html = path.join(SOFT, 'dashboard.html');
   const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   const text = (res, s, code = 200) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(s); };
@@ -444,7 +447,7 @@ function serve(port = 4777) {
 
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, '127.0.0.1', () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
+  }).listen(port, MACHINE.controlRoom.bind, () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -455,8 +458,14 @@ else if (cmd === 'resume') console.log(setControl('running'));
 else if (cmd === 'status') { console.log(getControl()); for (const c of listCheckpoints()) console.log('\n' + c.text); }
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
-else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
+else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || MACHINE.controlRoom.port);
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
+else if (cmd === 'supervise') require('./supervisor').supervise({ HOME, DIR, getControl, append });
+else if (cmd === 'backup') {
+  const { backup } = require('./backup');
+  const dest = backup({ HOME });
+  if (!dest) { console.error('backup: nothing to back up'); process.exit(1); }
+}
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | supervise | backup');

@@ -27,6 +27,8 @@ function studioHome() {
   return path.resolve(__dirname, '..', '..');
 }
 const REPO = studioHome();
+const machineLib = require('../studio/machine');
+const MACHINE = machineLib.load(REPO); // per-machine profile (REPO/.studio/machine.json)
 const PIPES = path.join(REPO, 'tools', 'engine', 'pipelines');
 const RUNS = path.join(REPO, '.studio', 'runs');
 const STUDIO = [path.join(__dirname, '..', 'studio', 'studio.js'), path.join(REPO, '.studio', 'studio.js')].find((p) => fs.existsSync(p));
@@ -126,13 +128,12 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
   // no shell (can't run builds/tests) — found 2026-11-07 when QA couldn't run `npm run build`.
   // Resolution order: env STUDIO_GIT_BASH → .studio/machine.json gitBash → system default.
   if (process.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
-    const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
-    const candidates = [process.env.STUDIO_GIT_BASH, machineCfg.gitBash, 'C:\\Program Files\\Git\\bin\\bash.exe'];
+    const candidates = [process.env.STUDIO_GIT_BASH, MACHINE.gitBash, 'C:\\Program Files\\Git\\bin\\bash.exe'];
     const found = candidates.find((p) => p && fs.existsSync(p));
     if (found) env.CLAUDE_CODE_GIT_BASH_PATH = found;
   }
   if (tier.local) Object.assign(env, {
-    ANTHROPIC_BASE_URL: 'http://127.0.0.1:11434', ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+    ANTHROPIC_BASE_URL: machineLib.ollamaUrl(MACHINE), ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
     ANTHROPIC_MODEL: tier.model, ANTHROPIC_DEFAULT_OPUS_MODEL: tier.model, ANTHROPIC_DEFAULT_SONNET_MODEL: tier.model,
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3:4b', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
   });

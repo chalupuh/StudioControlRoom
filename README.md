@@ -28,5 +28,17 @@ node engine/engine.js status | approve <run> approve|reject "<note>" | resume <r
 ```
 Pipelines live in HQ (`tools/engine/pipelines/*.json`). `{{soft}}` in a pipeline expands to this repo's root.
 
+## Supervisor & Backup
+```
+node studio/studio.js supervise          # long-running: keep services up, resume runs, daily backup at 03:00
+node studio/studio.js backup             # on-demand backup now
+```
+Installs a Windows Scheduled Task ("StudioSupervisor") to auto-start on boot:
+```powershell
+powershell -ExecutionPolicy Bypass -File studio\install-service.ps1     # install
+powershell -ExecutionPolicy Bypass -File studio\install-service.ps1 -Uninstall  # remove
+```
+Backups zip `runs/`, `checkpoints/`, `roster.json`, `events.jsonl`, and `docs/internal/` into `.studio/backups/<date>.zip`, keeping the 14 most recent.
+
 ## Development
 Branch, open a PR, CI must pass, then squash merge (see HQ ADR 0002). Tests: `npm --prefix studio/app test` and `node engine/test.js`.

@@ -3,6 +3,10 @@ studio/app-dist/
 bench/results/
 # machine-local: points at this PC's AIDevCompanyHQ checkout
 studio.home.json
+# per-machine profile (see studio/machine.example.json)
+.studio/machine.json
+# daily backups (kept locally, up to 14)
+.studio/backups/
 *.log
 *.part
 temp_*

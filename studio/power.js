@@ -5,6 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
+const machine = require('./machine');
 
 const isWin = process.platform === 'win32';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -25,9 +26,10 @@ const gpuUsed = () => { try { return execFileSync('nvidia-smi', ['--query-gpu=me
 
 async function unloadOllama() {
   try {
-    const r = await fetch('http://127.0.0.1:11434/api/ps', { signal: AbortSignal.timeout(3000) });
+    const base = machine.ollamaUrl(machine.load());
+    const r = await fetch(base + '/api/ps', { signal: AbortSignal.timeout(3000) });
     const { models = [] } = await r.json();
-    for (const m of models) await fetch('http://127.0.0.1:11434/api/generate', { method: 'POST', body: JSON.stringify({ model: m.name, keep_alive: 0 }), signal: AbortSignal.timeout(10000) }).catch(() => {});
+    for (const m of models) await fetch(base + '/api/generate', { method: 'POST', body: JSON.stringify({ model: m.name, keep_alive: 0 }), signal: AbortSignal.timeout(10000) }).catch(() => {});
     return models.map((m) => m.name);
   } catch { return []; }
 }
@@ -99,7 +101,9 @@ function startup(ctx) {
     // Start the Ollama *server* headless (the tray app doesn't reliably start it and isn't needed).
     const exe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe');
     if (fs.existsSync(exe) && !studioProcesses().some((p) => p.name === 'ollama.exe')) {
-      const env = { OLLAMA_KEEP_ALIVE: '5m', OLLAMA_HOST: '127.0.0.1:11434', OLLAMA_NUM_PARALLEL: '4', ...process.env };
+      const m = machine.load(ctx.HOME);
+      const env = { OLLAMA_KEEP_ALIVE: String(m.ollama.keepAlive), OLLAMA_HOST: machine.ollamaHost(m), OLLAMA_NUM_PARALLEL: String(m.ollama.numParallel), ...process.env };
+      if (m.ollama.contextLength) env.OLLAMA_CONTEXT_LENGTH = String(m.ollama.contextLength);
       spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true, env }).unref(); log('• Ollama server started (headless)');
     } else log('• Ollama already running (or not installed)');
   }
@@ -108,7 +112,7 @@ function startup(ctx) {
   if (!up) {
     const out = fs.openSync(path.join(ctx.DIR, 'server.log'), 'a');
     spawn(process.execPath, [path.join(__dirname, 'studio.js'), 'serve'], { detached: true, stdio: ['ignore', out, out], windowsHide: true }).unref();
-    log('• Control Room server started → http://localhost:4777');
+    log('• Control Room server started → http://localhost:' + machine.load(ctx.HOME).controlRoom.port);
   } else log('• Control Room server already running');
   log('Studio is still PAUSED. Flip the switch to Running (or `studio.js resume`) when you want agents to work.');
 }

@@ -13,6 +13,9 @@ const SUITES = [
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
+  { file: 'selftest-machine.js',      label: 'per-machine profile (machine.json)' },
+  { file: 'selftest-supervisor.js',   label: 'supervisor (resume paused, skip blocked, no double start)' },
+  { file: 'selftest-backup.js',       label: 'backup (collect sources, prune old zips)' },
 ];
 
 let anyFailed = false;
