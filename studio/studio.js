@@ -11,6 +11,10 @@
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const os = require('os');
+
+// Auth: extracted to testable module; studio-local functions delegate to it.
+const auth = require('./auth');
 
 // SOFT = where this software lives (dashboard.html, app-dist). HOME = the org workspace (agents, docs,
 // runtime data in HOME/.studio). They are the same folder today; after the StudioControlRoom split they differ.
@@ -193,6 +197,91 @@ function parseEvents(text) {
 }
 function readEvents() { return fs.existsSync(LOG) ? parseEvents(fs.readFileSync(LOG, 'utf8')) : []; }
 
+// ---- Auth token ----
+const AUTH_FILE = path.join(DIR, 'auth.json');
+function readAuth() { try { return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8')); } catch { return null; } }
+function writeAuth(a) { fs.writeFileSync(AUTH_FILE, JSON.stringify(a, null, 2)); }
+function generateToken() { return crypto.randomBytes(24).toString('hex'); }
+function ensureToken() {
+  let a = readAuth();
+  if (!a || !a.token) {
+    a = { token: generateToken(), created: Date.now() };
+    writeAuth(a);
+  }
+  return a;
+}
+function currentToken() { return readAuth()?.token || null; }
+function verifyToken(provided) {
+  if (!provided) return false;
+  const expected = currentToken();
+  if (!expected) return false;
+  // constant-time comparison (timingSafeCompare removed in Node 24, use subtle)
+  return subtle.timingSafeCompare(
+    new Uint8Array(Buffer.from(provided)),
+    new Uint8Array(Buffer.from(expected))
+  );
+}
+
+// ---- LAN bind address ----
+function getLanBind() {
+  // Respect STUDIO_BIND env; fall back to LAN address; last resort 127.0.0.1
+  if (process.env.STUDIO_BIND) return process.env.STUDIO_BIND;
+  try {
+    const ifaces = os.networkInterfaces();
+    for (const name of Object.keys(ifaces)) {
+      for (const iface of ifaces[name]) {
+        if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+      }
+    }
+  } catch {}
+  return '127.0.0.1';
+}
+
+// ---- Rate limiter (per-IP, in-memory) ----
+// Windowed counters: tracks requests per 60 s window per IP key.
+const rateBuckets = new Map();
+const RATE_WINDOW_MS = 60_000;
+const RATE_LIMIT = 120;
+function rateLimitKey(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) return String(forwarded).split(',')[0].trim();
+  const socket = req.connection?.remoteAddress;
+  return socket ? socket.replace(/^::ffff:/, '') : 'unknown';
+}
+function checkRateLimit(ip) {
+  const now = Date.now();
+  let bucket = rateBuckets.get(ip);
+  if (!bucket || now - bucket.start > RATE_WINDOW_MS) {
+    bucket = { start: now, count: 0 };
+    rateBuckets.set(ip, bucket);
+  }
+  bucket.count++;
+  // prune old buckets every check
+  if (rateBuckets.size > 500) {
+    for (const [k, v] of rateBuckets) { if (now - v.start > RATE_WINDOW_MS) rateBuckets.delete(k); }
+  }
+  return bucket.count <= RATE_LIMIT;
+}
+
+// ---- Auth middleware factory ----
+// Returns (req, res) => true|false. false = wrote 401/429 and ended response.
+function makeAuthMiddleware(json, text) {
+  return (req, res) => {
+    const ip = rateLimitKey(req);
+    if (!checkRateLimit(ip)) {
+      json(res, { error: 'rate limited' }, 429);
+      return false;
+    }
+    const token = req.headers['authorization']?.replace(/^Bearer\s+/i, '')
+      || new URL(req.url, 'http://x').searchParams.get('token');
+    if (!verifyToken(token)) {
+      json(res, { error: 'unauthorized' }, 401);
+      return false;
+    }
+    return true;
+  };
+}
+
 function runSummary(run) {
   const cur = run.cursor || 0;
   const stages = (run.stages || []).map((s, i) => ({
@@ -345,6 +434,7 @@ function serve(port = 4777) {
   const html = path.join(SOFT, 'dashboard.html');
   const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   const text = (res, s, code = 200) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(s); };
+  const auth = makeAuthMiddleware(json, text);
   startWatchers();
 
   async function handle(req, res) {
@@ -367,6 +457,11 @@ function serve(port = 4777) {
     if (p === '/v1') return sendFile(res, html, { 'Cache-Control': 'no-store' });
 
     // ---- v2 API ----
+    if (p === '/api/pair' && m === 'POST') {
+      ensureToken();
+      return json(res, { token: currentToken(), method: 'bearer' });
+    }
+    if (p.startsWith('/api/') && p !== '/api/pair' && !auth(req, res)) return;
     if (p === '/api/state' && m === 'GET') return json(res, getState());
     if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
     if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
@@ -444,7 +539,14 @@ function serve(port = 4777) {
 
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, '127.0.0.1', () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
+  }).listen(port, '0.0.0.0', () => {
+    const lan = getLanBind();
+    try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {}
+    console.log(`Studio dashboard: http://localhost:${port}`);
+    if (lan !== '127.0.0.1' && lan !== '::1') {
+      console.log(`LAN:            http://${lan}:${port}`);
+    }
+  });
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -456,6 +558,15 @@ else if (cmd === 'status') { console.log(getControl()); for (const c of listChec
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
 else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
+else if (cmd === 'token') {
+  // Show current token or regenerate on --regen
+  const a = ensureToken();
+  console.log(`token: ${a.token}`);
+  if (rest.includes('--regen')) {
+    writeAuth({ token: generateToken(), created: Date.now() });
+    console.log(`NEW token: ${currentToken()}`);
+  }
+}
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
