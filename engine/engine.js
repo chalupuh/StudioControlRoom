@@ -4,13 +4,14 @@
 //
 //   node tools/engine/engine.js start <pipeline> [--var key=value ...]   create + run until a gate/stop
 //   node tools/engine/engine.js resume <runId>                            continue (after approve / un-pause)
-//   node tools/engine/engine.js approve <runId> [approve|reject] ["note"] answer the owner gate
+//   node tools/engine/engine.js approve <runId> [approve|park|reject] ["note"] answer the owner gate (park = decide later; resume re-opens it)
+//   node tools/engine/engine.js approve <runId> items '<json {item: approve|park|reject}>' ["note"]   per-item decisions, written back into the gate's file
 //   node tools/engine/engine.js status [runId]                            list runs / show one
 //   node tools/engine/engine.js pipelines                                  list pipelines
 //
 // Pipeline stage types (tools/engine/pipelines/*.json):
 //   agent   { id, agent, tier: local|local-fast|sonnet|opus, task, expect:[paths], check:"cmd", maxTurns }
-//   gate    { id, title, show:[paths] }            stops until the owner approves
+//   gate    { id, title, show:[paths], items?:{ file, regex } }  stops until the owner decides; items = per-item decisions
 //   script  { id, run:"cmd" }                       deterministic step, no model
 //   foreach { id, items:{ file, regex }, stages:[...] }  repeats sub-stages per match ({{item}})
 const fs = require('fs');
@@ -169,6 +170,57 @@ function resolveTeamLead(designPath) {
 	return 'mobile-dev';
 }
 
+// ---- gate items (Owner Inbox) ----
+const ITEM_DECISIONS = ['approve', 'park', 'reject'];
+const cap = (w) => w[0].toUpperCase() + w.slice(1);
+const CHOICE = /approve\s*\/\s*park\s*\/\s*reject/i;
+// Items a gate asks the owner to decide: every regex match in the file (group 1 or whole match, trimmed).
+function parseItems(spec, vars) {
+  if (!spec || !spec.file || !spec.regex) return [];
+  let src = ''; try { src = fs.readFileSync(path.resolve(REPO, fill(spec.file, vars || {})), 'utf8'); } catch { return []; }
+  const seen = new Set(), out = [];
+  for (const m of src.matchAll(new RegExp(spec.regex, 'gm'))) {
+    const id = (m[1] || m[0]).trim();
+    if (id && !seen.has(id)) { seen.add(id); out.push({ id, text: m[0].trim() }); }
+  }
+  return out;
+}
+// Write decisions into the file's Owner decision lines: tick the box, replace "Approve / Park / Reject" with the chosen word.
+function writeItemDecisions(spec, vars, map) {
+  const f = path.resolve(REPO, fill(spec.file, vars || {}));
+  const re = new RegExp(spec.regex, 'm');
+  const out = fs.readFileSync(f, 'utf8').split('\n').map((line) => {
+    const m = line.match(re); const id = m && (m[1] || m[0]).trim();
+    if (!id || !Object.prototype.hasOwnProperty.call(map, id)) return line;
+    const l = line.replace(/\[[ xX]?\]/, '[x]');
+    return CHOICE.test(l) ? l.replace(CHOICE, cap(map[id])) : l.replace(/\s*$/, '') + ' \u2192 ' + cap(map[id]);
+  });
+  fs.writeFileSync(f, out.join('\n'));
+}
+// Record a decision on a waiting gate: approve|park|reject, or a map of per-item decisions (outcome derived:
+// any approve -> approved, else any park -> parked, else rejected). Throws on bad input. Returns the gate status.
+function decideGate(run, gid, decision, note, map) {
+  const g = run.gates[gid];
+  if (map) {
+    const known = new Set((g.itemList || []).map((i) => i.id));
+    if (!g.items || !known.size) throw new Error('gate has no items');
+    const entries = Object.entries(map);
+    if (!entries.length) throw new Error('items map is empty');
+    for (const [k, v] of entries) {
+      if (!known.has(k)) throw new Error('unknown item: ' + k);
+      if (!ITEM_DECISIONS.includes(v)) throw new Error('bad decision for ' + k + ': ' + v);
+    }
+    writeItemDecisions(g.items, run.vars, map);
+    g.itemDecisions = { ...(g.itemDecisions || {}), ...map };
+    const all = Object.values(g.itemDecisions);
+    decision = all.includes('approve') ? 'approve' : all.includes('park') ? 'park' : 'reject';
+  } else if (!ITEM_DECISIONS.includes(decision)) throw new Error('decision must be approve, park or reject');
+  g.status = { approve: 'approved', park: 'parked', reject: 'rejected' }[decision];
+  Object.assign(g, { note: note || '', decided: now() });
+  if (decision === 'park') run.status = 'parked'; else if (decision === 'reject') run.status = 'stopped';
+  return g.status;
+}
+
 // ---- the state machine ----
 function advance(run) {
   while (run.cursor < run.stages.length) {
@@ -180,12 +232,14 @@ function advance(run) {
       const g = run.gates[stage.id];
       if (!g) {
         run.gates[stage.id] = { status: 'waiting', title: fill(stage.title, vars), show: (stage.show || []).map((s) => fill(s, vars)), since: now() };
+        if (stage.items) { const g2 = run.gates[stage.id]; g2.items = { file: fill(stage.items.file, vars), regex: stage.items.regex }; g2.itemList = parseItems(g2.items, vars); }
         run.status = 'waiting-gate'; save(run);
         ev({ type: 'gate', agent: 'owner', run: run.id, message: `Needs your decision: ${fill(stage.title, vars)}` });
         console.log(`\n⏸ OWNER GATE "${stage.id}": ${fill(stage.title, vars)}\n   Review: ${(stage.show || []).map((s) => fill(s, vars)).join(', ')}\n   Then: node tools/engine/engine.js approve ${run.id} approve|reject "<note>"`);
         return;
       }
       if (g.status === 'waiting') { run.status = 'waiting-gate'; save(run); console.log('Still waiting on gate ' + stage.id); return; }
+      if (g.status === 'parked') { run.status = 'parked'; save(run); console.log('Gate ' + stage.id + ' is parked. Re-open with: engine.js resume ' + run.id); return; }
       if (g.status === 'rejected') { run.status = 'stopped'; save(run); console.log('Owner rejected at ' + stage.id + '. Run stopped.'); return; }
       run.cursor++; continue;
     }
@@ -225,7 +279,7 @@ function advance(run) {
       const res = runAgent(stage, tierName, vars, feedback);
       const problems = verify(stage, vars, res);
       run.history.push({ stage: stage.id, agent: stage.agent, attempt: attempt + 1, ...res, ok: !problems.length, problems, at: now() });
-      ev({ type: 'usage', agent: stage.agent, tier: tierName, model: res.model, cloud: res.cloud, tokensIn: res.usage?.in || 0, tokensOut: res.usage?.out || 0, secs: res.secs });
+      ev({ type: 'usage', agent: stage.agent, runId: run.id, pipeline: run.pipeline, project: vars.slug || run.pipeline, stage: stage.id, stageTier: stage.tier || 'local', ok: !problems.length, tier: tierName, model: res.model, cloud: res.cloud, tokensIn: res.usage?.in || 0, tokensOut: res.usage?.out || 0, secs: res.secs });
       if (!problems.length) {
         done = true;
         ev({ type: 'done', agent: stage.agent, to: 'manager', task: `${stage.id} ✓ (${tierName}, ${res.secs}s)` });
@@ -266,14 +320,18 @@ if (require.main === module) {
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
 		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
 	} else if (cmd === 'resume') {
-		const run = load(rest[0]); run.status = 'running'; save(run); advance(run);
+		const run = load(rest[0]);
+		for (const g of Object.values(run.gates)) if (g.status === 'parked') { g.status = 'waiting'; g.since = now(); delete g.decided; } // parked gates re-open for a decision
+		run.status = 'running'; save(run); advance(run);
 	} else if (cmd === 'approve') {
-		const run = load(rest[0]); const decision = rest[1] || 'approve';
+		const run = load(rest[0]); const isItems = rest[1] === 'items';
+		const decision = isItems ? null : rest[1] || 'approve'; const note = (isItems ? rest[3] : rest[2]) || '';
 		const gid = Object.keys(run.gates).find((k) => run.gates[k].status === 'waiting');
 		if (!gid) { console.log('No gate is waiting.'); process.exit(0); }
-		Object.assign(run.gates[gid], { status: decision === 'reject' ? 'rejected' : 'approved', note: rest[2] || '', decided: now() });
-		ev({ type: 'progress', agent: 'owner', pct: 100, status: 'done', message: `Gate ${gid}: ${run.gates[gid].status}${rest[2] ? ' (' + rest[2] + ')' : ''}` });
-		save(run); console.log(`Gate ${gid} ${run.gates[gid].status}.`); if (decision !== 'reject') advance(run); else { run.status = 'stopped'; save(run); }
+		let map; if (isItems) { try { map = JSON.parse(rest[2]); if (!map || typeof map !== 'object' || Array.isArray(map)) throw 0; } catch { console.error('items needs a JSON object: {"item":"approve|park|reject"}'); process.exit(1); } }
+		let status; try { status = decideGate(run, gid, decision, note, map); } catch (e) { console.error(e.message); process.exit(1); }
+		ev({ type: 'progress', agent: 'owner', pct: 100, status: 'done', message: `Gate ${gid}: ${status}${note ? ' (' + note + ')' : ''}` });
+		save(run); console.log(`Gate ${gid} ${status}.`); if (status === 'approved') advance(run);
 	} else if (cmd === 'status') {
 		if (rest[0]) { const r = load(rest[0]); console.log(JSON.stringify({ ...r, stages: r.stages.map((s, i) => `${i === r.cursor ? '→ ' : '  '}${s.id}`) }, null, 2)); }
 		else if (fs.existsSync(RUNS)) for (const f of fs.readdirSync(RUNS).filter((f) => f.endsWith('.json'))) { const r = load(f.replace('.json', '')); console.log(`${r.id.padEnd(40)} ${r.status.padEnd(13)} at ${r.stages[r.cursor]?.id || '(end)'}`); }
@@ -282,4 +340,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { parseRunOutput, verify, resolveTeamLead };
+module.exports = { parseRunOutput, verify, resolveTeamLead, parseItems, decideGate };

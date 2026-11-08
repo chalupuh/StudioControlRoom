@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { fmtDuration, fmtTokens, isCloudTier, budgetLevel, isEscalation, needsOwner } from './format';
-import type { RunSummary } from '../../api';
+import { fmtRate, fallbackRows, fmtDuration, fmtTokens, isCloudTier, budgetLevel, isEscalation, needsOwner, deriveGateOutcome, decisionCounts, decisionSummary, decisionLabel } from './format';
+import type { GateItem, RunSummary } from '../../api';
 
 describe('fmtDuration', () => {
   it('returns dash for negative or non-finite values', () => {
@@ -153,5 +153,73 @@ describe('needsOwner', () => {
     expect(needsOwner({ status: 'done' } as RunSummary)).toBe(false);
     expect(needsOwner({ status: 'paused' } as RunSummary)).toBe(false);
     expect(needsOwner({ status: 'stopped' } as RunSummary)).toBe(false);
+  });
+});
+
+const it_ = (id: string, decision?: GateItem['decision']): GateItem => ({ id, text: id, decision });
+
+describe('deriveGateOutcome', () => {
+  it('is undefined when nothing is decided', () => {
+    expect(deriveGateOutcome([])).toBeUndefined();
+    expect(deriveGateOutcome([it_('a'), it_('b')])).toBeUndefined();
+  });
+  it('any approve wins', () => {
+    expect(deriveGateOutcome([it_('a', 'reject'), it_('b', 'park'), it_('c', 'approve')])).toBe('approve');
+  });
+  it('park beats reject when nothing is approved', () => {
+    expect(deriveGateOutcome([it_('a', 'reject'), it_('b', 'park'), it_('c')])).toBe('park');
+  });
+  it('rejects when all decided items are rejected', () => {
+    expect(deriveGateOutcome([it_('a', 'reject'), it_('b')])).toBe('reject');
+  });
+});
+
+describe('decisionCounts', () => {
+  it('counts each bucket', () => {
+    expect(decisionCounts([it_('a', 'approve'), it_('b', 'approve'), it_('c', 'park'), it_('d', 'reject'), it_('e')]))
+      .toEqual({ approve: 2, park: 1, reject: 1, undecided: 1 });
+  });
+  it('handles empty', () => {
+    expect(decisionCounts([])).toEqual({ approve: 0, park: 0, reject: 0, undecided: 0 });
+  });
+});
+
+describe('decisionSummary / decisionLabel', () => {
+  it('joins non-zero buckets', () => {
+    expect(decisionSummary([it_('a', 'approve'), it_('b', 'park'), it_('c', 'reject'), it_('d')]))
+      .toBe('1 approved · 1 parked · 1 rejected · 1 undecided');
+  });
+  it('omits empty buckets and is empty for no items', () => {
+    expect(decisionSummary([it_('a', 'reject')])).toBe('1 rejected');
+    expect(decisionSummary([])).toBe('');
+  });
+  it('labels decisions', () => {
+    expect(decisionLabel('approve')).toBe('Approved');
+    expect(decisionLabel('park')).toBe('Parked');
+    expect(decisionLabel('reject')).toBe('Rejected');
+  });
+});
+
+describe('fmtRate', () => {
+  it('formats a 0..1 rate as a whole percent', () => {
+    expect(fmtRate(0)).toBe('0%');
+    expect(fmtRate(0.256)).toBe('26%');
+    expect(fmtRate(1)).toBe('100%');
+  });
+  it('returns dash for invalid input', () => {
+    expect(fmtRate(NaN)).toBe('–');
+    expect(fmtRate(-0.1)).toBe('–');
+  });
+});
+
+describe('fallbackRows', () => {
+  const row = (localStages: number, fallbackStages: number, fallbackRate: number) => ({ localStages, fallbackStages, fallbackRate });
+  it('sorts by rate, skips agents without local stages, flags only rates above 25%', () => {
+    const rows = fallbackRows({ a: row(10, 2, 0.2), b: row(8, 4, 0.5), c: row(0, 0, 0), d: row(4, 1, 0.25) });
+    expect(rows.map((r) => r.id)).toEqual(['b', 'd', 'a']);
+    expect(rows.map((r) => r.alert)).toEqual([true, false, false]);
+  });
+  it('handles empty input', () => {
+    expect(fallbackRows({})).toEqual([]);
   });
 });

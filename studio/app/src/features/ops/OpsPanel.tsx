@@ -2,9 +2,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { useStudio } from '../../store';
-import { api, type Gpu, type RunSummary, type Usage } from '../../api';
+import { api, type GateDecision, type GateItem as GateItemData, type Gpu, type RunSummary, type Usage } from '../../api';
 import { renderMarkdown } from './markdown';
-import { budgetLevel, fmtDuration, fmtTokens, isCloudTier, isEscalation, needsOwner } from './format';
+import { budgetLevel, decisionCounts, decisionLabel, decisionSummary, deriveGateOutcome, fallbackRows, fmtDuration, fmtRate, fmtTokens, isCloudTier, isEscalation, needsOwner } from './format';
 import './ops.css';
 
 type Studio = ReturnType<typeof useStudio>;
@@ -81,12 +81,25 @@ function GateItem({ run, now, onDone }: { run: RunSummary; now: number; onDone: 
   const [err, setErr] = useState<string | null>(null);
   const noteId = 'note-' + run.id;
 
-  const decide = async (d: 'approve' | 'reject') => {
+  const items: GateItemData[] | undefined = gate.items && gate.items.length > 0 ? gate.items : undefined;
+  const [choices, setChoices] = useState<Record<string, GateDecision>>({});
+  const decided: GateItemData[] = (items ?? []).map((it) => ({ ...it, decision: choices[it.id] }));
+  const outcome = deriveGateOutcome(decided);
+
+  const send = async (d: GateDecision | undefined, map?: Record<string, GateDecision>, summary?: string) => {
     setBusy(true); setErr(null);
-    try { await api.gate(run.id, d, note.trim()); setSent(d === 'approve' ? 'Approved' : 'Rejected'); setConfirming(false); onDone(); }
+    try {
+      const res = await api.gate(run.id, d, note.trim(), map) as { ok?: boolean; error?: string } | undefined;
+      if (res && res.ok === false) throw new Error(res.error || 'Request rejected');
+      const eff = d ?? outcome;
+      const label = eff ? decisionLabel(eff) : 'Decided';
+      setSent(summary ? `${label}: ${summary}` : label); setConfirming(false); onDone();
+    }
     catch (e) { setErr(errMsg(e)); }
     finally { setBusy(false); }
   };
+  const decide = (d: GateDecision) => send(d);
+  const submitItems = () => send(undefined, choices, decisionSummary(decided));
 
   return (
     <li className="inbox-item gate">
@@ -112,18 +125,48 @@ function GateItem({ run, now, onDone }: { run: RunSummary; now: number; onDone: 
           <label className="note" htmlFor={noteId}>Note (optional)
             <textarea id={noteId} rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Reason or instructions for the engine" />
           </label>
-          <div className="actions">
-            <button type="button" className="btn ok" disabled={busy} onClick={() => decide('approve')}>Approve</button>
-            {!confirming
-              ? <button type="button" className="btn danger" disabled={busy} onClick={() => setConfirming(true)}>Reject</button>
-              : (
-                <span className="confirm" role="group" aria-label="Confirm rejection">
-                  <span>Reject this gate?</span>
-                  <button type="button" className="btn danger" disabled={busy} onClick={() => decide('reject')}>Yes, reject</button>
-                  <button type="button" className="btn" disabled={busy} onClick={() => setConfirming(false)}>Cancel</button>
-                </span>
-              )}
-          </div>
+          {items ? (
+            <>
+              <ul className="gate-items" aria-label="Items to decide">
+                {items.map((it) => (
+                  <li key={it.id}>
+                    <span className="item-text">{it.text}</span>
+                    <span className="item-choices" role="group" aria-label={'Decision for ' + it.text}>
+                      {(['approve', 'park', 'reject'] as const).map((d) => (
+                        <button key={d} type="button" className={'btn choice ' + d + (choices[it.id] === d ? ' on' : '')}
+                          aria-pressed={choices[it.id] === d} disabled={busy}
+                          onClick={() => setChoices((c) => {
+                            const n = { ...c };
+                            if (n[it.id] === d) delete n[it.id]; else n[it.id] = d;
+                            return n;
+                          })}>{d === 'approve' ? 'Approve' : d === 'park' ? 'Park' : 'Reject'}</button>
+                      ))}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <p className="ops-muted" role="status">
+                {outcome ? `Gate outcome: ${decisionLabel(outcome)} (${decisionSummary(decided)})` : 'Decide at least one item to submit.'}
+              </p>
+              <div className="actions">
+                <button type="button" className="btn ok" disabled={busy || !outcome} onClick={submitItems}>Submit</button>
+              </div>
+            </>
+          ) : (
+            <div className="actions">
+              <button type="button" className="btn ok" disabled={busy} onClick={() => decide('approve')}>Approve</button>
+              <button type="button" className="btn" disabled={busy} onClick={() => decide('park')}>Park</button>
+              {!confirming
+                ? <button type="button" className="btn danger" disabled={busy} onClick={() => setConfirming(true)}>Reject</button>
+                : (
+                  <span className="confirm" role="group" aria-label="Confirm rejection">
+                    <span>Reject this gate?</span>
+                    <button type="button" className="btn danger" disabled={busy} onClick={() => decide('reject')}>Yes, reject</button>
+                    <button type="button" className="btn" disabled={busy} onClick={() => setConfirming(false)}>Cancel</button>
+                  </span>
+                )}
+            </div>
+          )}
         </>
       )}
       {err && <p className="ops-error" role="alert">Failed: {err}</p>}
@@ -322,6 +365,9 @@ function Budget() {
     const cloudShare = total > 0 ? (today.cloudTokens / total) * 100 : 0;
     const agents = Object.entries(byAgent || {}).map(([id, v]) => ({ id, ...v, total: v.cloudTokens + v.localTokens }))
       .sort((a, b) => b.total - a.total).slice(0, 6);
+    const projects = Object.entries(data.byProject || {}).map(([id, v]) => ({ id, ...v }))
+      .sort((a, b) => (b.cloudTokens + b.localTokens) - (a.cloudTokens + a.localTokens));
+    const fallbacks = fallbackRows(byAgent);
     body = (
       <>
         {error && <ErrorLine msg={error} />}
@@ -353,6 +399,27 @@ function Budget() {
               <tr key={a.id}><th scope="row">{a.id}</th><td className="num">{fmtTokens(a.cloudTokens)}</td><td className="num">{fmtTokens(a.localTokens)}</td><td className="num">{a.calls}</td></tr>
             ))}</tbody>
           </table></div>
+        )}
+        <h3 className="sub">By project</h3>
+        {projects.length === 0 ? <p className="ops-muted">No project usage recorded.</p> : (
+          <div className="tbl"><table>
+            <thead><tr><th scope="col">Project</th><th scope="col" className="num">Cloud (Claude)</th><th scope="col" className="num">Local (this PC)</th><th scope="col" className="num">Calls</th></tr></thead>
+            <tbody>{projects.map((p) => (
+              <tr key={p.id}><th scope="row">{p.id}</th><td className="num">{fmtTokens(p.cloudTokens)}</td><td className="num">{fmtTokens(p.localTokens)}</td><td className="num">{p.calls}</td></tr>
+            ))}</tbody>
+          </table></div>
+        )}
+        <h3 className="sub">Local to Claude fallback rate (30 days)</h3>
+        {fallbacks.length === 0 ? <p className="ops-muted">No local stages recorded.</p> : (
+          <ul className="fallback-list">
+            {fallbacks.map((f) => (
+              <li key={f.id} className={f.alert ? 'fallback alert' : 'fallback'}>
+                <strong>{f.id}</strong>: <span className="num">{fmtRate(f.rate)}</span>
+                <span className="ops-muted"> ({f.fallbackStages} of {f.localStages} local stages)</span>
+                {f.alert && <span className="lvl over"> Above 25%: ADR 0001 says to move this agent to Claude.</span>}
+              </li>
+            ))}
+          </ul>
         )}
       </>
     );

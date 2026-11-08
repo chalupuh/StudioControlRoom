@@ -200,7 +200,10 @@ function runSummary(run) {
   }));
   let gate;
   for (const [id, g] of Object.entries(run.gates || {})) {
-    if (g && g.status === 'waiting') gate = { id, title: g.title || id, show: g.show || [], since: g.since };
+    if (g && g.status === 'waiting') {
+      gate = { id, title: g.title || id, show: g.show || [], since: g.since };
+      if (Array.isArray(g.itemList) && g.itemList.length) gate.items = g.itemList.map((i) => ({ id: i.id, text: i.text, ...(g.itemDecisions && g.itemDecisions[i.id] ? { decision: g.itemDecisions[i.id] } : {}) }));
+    }
   }
   const out = {
     id: run.id, pipeline: run.pipeline, status: run.status, vars: run.vars || {},
@@ -230,7 +233,7 @@ const dayKey = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${St
 function getUsage() {
   const budget = { dailyCloudTokens: 200000, ...readJson(path.join(DIR, 'budget.json'), {}) };
   const today = { cloudTokens: 0, localTokens: 0, cloudCalls: 0, localCalls: 0 };
-  const byAgent = {};
+  const byAgent = {}, byProject = {}, fb = {};
   const days = {};
   const todayKey = dayKey(Date.now());
   for (let i = 13; i >= 0; i--) { const k = dayKey(Date.now() - i * 86400000); days[k] = { day: k, cloudTokens: 0, localTokens: 0 }; }
@@ -240,10 +243,18 @@ function getUsage() {
     const k = dayKey(e.ts), cloud = !!e.cloud;
     const a = (byAgent[e.agent] = byAgent[e.agent] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
     a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.calls++; a.secs += Number(e.secs) || 0;
+    const pk = e.project || e.pipeline || 'unknown';
+    const pr = (byProject[pk] = byProject[pk] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
+    pr[cloud ? 'cloudTokens' : 'localTokens'] += tok; pr.calls++; pr.secs += Number(e.secs) || 0;
+    // fallback: successful attempt of a local-tier stage that ran on a cloud tier (30 days, one per run+stage)
+    if (e.ok === true && /^local/.test(e.stageTier || '') && Date.now() - e.ts <= 30 * 86400000) fb[`${e.runId}|${e.stage}|${e.agent}`] = { agent: e.agent, cloud };
     if (days[k]) days[k][cloud ? 'cloudTokens' : 'localTokens'] += tok;
     if (k === todayKey) { today[cloud ? 'cloudTokens' : 'localTokens'] += tok; today[cloud ? 'cloudCalls' : 'localCalls']++; }
   }
-  return { budget, today, byAgent, byDay: Object.values(days) };
+  for (const a of Object.values(byAgent)) Object.assign(a, { localStages: 0, fallbackStages: 0, fallbackRate: 0, fallbackAlert: false });
+  for (const f of Object.values(fb)) { const a = byAgent[f.agent]; if (!a) continue; a.localStages++; if (f.cloud) a.fallbackStages++; }
+  for (const a of Object.values(byAgent)) { a.fallbackRate = a.localStages ? a.fallbackStages / a.localStages : 0; a.fallbackAlert = a.fallbackRate > 0.25; } // ADR 0001
+  return { budget, today, byAgent, byProject, byDay: Object.values(days) };
 }
 
 // ---- GPU / Ollama / ComfyUI (cached 2 s, never throws) ----
@@ -387,11 +398,25 @@ function serve(port = 4777) {
       const runId = decodeURIComponent(mt[1]);
       if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
       const b = await readBody(req);
-      if (b.decision !== 'approve' && b.decision !== 'reject') return json(res, { error: 'decision must be approve or reject' }, 400);
+      const hasItems = b.items !== undefined && b.items !== null;
+      // With items, the gate outcome is derived from them (any approve -> approve, else any park -> park, else reject), so decision is optional.
+      if (!hasItems && !['approve', 'park', 'reject'].includes(b.decision)) return json(res, { error: 'decision must be approve, park or reject' }, 400);
+      if (b.decision !== undefined && !['approve', 'park', 'reject'].includes(b.decision)) return json(res, { error: 'decision must be approve, park or reject' }, 400);
       const note = typeof b.note === 'string' ? b.note.slice(0, 2000) : '';
       const run = readJson(path.join(RUNS, runId + '.json'), null);
       if (!run) return json(res, { error: 'run not found' }, 404);
       if (run.status !== 'waiting-gate') return json(res, { error: 'run is not waiting at a gate' }, 409);
+      if (hasItems) {
+        if (typeof b.items !== 'object' || Array.isArray(b.items) || !Object.keys(b.items).length) return json(res, { error: 'items must be a non-empty object of item -> approve|park|reject' }, 400);
+        const g = Object.values(run.gates || {}).find((x) => x && x.status === 'waiting');
+        const known = new Set(((g && g.itemList) || []).map((i) => i.id));
+        for (const [k, v] of Object.entries(b.items)) {
+          if (!known.has(k)) return json(res, { error: 'unknown item: ' + k.slice(0, 80) }, 400);
+          if (!['approve', 'park', 'reject'].includes(v)) return json(res, { error: 'item decisions must be approve, park or reject' }, 400);
+        }
+        spawnEngine(['approve', runId, 'items', JSON.stringify(b.items), note], runId);
+        return json(res, { ok: true });
+      }
       spawnEngine(['approve', runId, b.decision, note], runId);
       return json(res, { ok: true });
     }

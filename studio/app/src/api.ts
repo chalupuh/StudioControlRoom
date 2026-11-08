@@ -18,6 +18,7 @@ export interface StudioEvent {
   // usage events (engine): one per stage attempt
   tier?: 'local' | 'local-fast' | 'sonnet' | 'opus'; model?: string; cloud?: boolean;
   tokensIn?: number; tokensOut?: number; secs?: number;
+  runId?: string; pipeline?: string; project?: string; stage?: string; stageTier?: string; ok?: boolean;
 }
 
 /** .studio/roster.json: the cast. Portrait paths are served from /portraits/<file>. */
@@ -36,12 +37,16 @@ export interface Control {
 export interface Checkpoint { agent: string; ts: number; text: string; }
 export interface ModelInfo { brain?: string; local?: { name: string; role?: string; kind: string; ref: string; installed: boolean }[]; }
 
-/** Engine run (.studio/runs/<id>.json), trimmed for the UI. */
+export type GateDecision = 'approve' | 'park' | 'reject';
+/** One decidable item of a gate (parsed from the gate's items.file by items.regex). */
+export interface GateItem { id: string; text: string; decision?: GateDecision; }
+
+/** Engine run (.studio/runs/<id>.json), trimmed for the UI. 'parked' = gate parked by the owner; resume re-opens it. */
 export interface RunSummary {
-  id: string; pipeline: string; status: 'running' | 'waiting-gate' | 'blocked' | 'paused' | 'done' | 'stopped';
+  id: string; pipeline: string; status: 'running' | 'waiting-gate' | 'parked' | 'blocked' | 'paused' | 'done' | 'stopped';
   vars: Record<string, string>; created: string; updated: string;
   stages: { id: string; type: string; agent?: string; tier?: string; state: 'pending' | 'current' | 'done' }[];
-  gate?: { id: string; title: string; show: string[]; since: string };   // present when waiting
+  gate?: { id: string; title: string; show: string[]; since: string; items?: GateItem[] };   // present when waiting; items when the gate declares them
   blockedReason?: string;
   attempts: { stage: string; agent?: string; tier?: string; ok: boolean; secs?: number; problems?: string[]; at: string }[];
 }
@@ -49,7 +54,9 @@ export interface RunSummary {
 export interface Usage {
   budget: { dailyCloudTokens: number };                      // .studio/budget.json
   today: { cloudTokens: number; localTokens: number; cloudCalls: number; localCalls: number };
-  byAgent: Record<string, { cloudTokens: number; localTokens: number; calls: number; secs: number }>;
+  byAgent: Record<string, { cloudTokens: number; localTokens: number; calls: number; secs: number;
+    localStages: number; fallbackStages: number; fallbackRate: number; fallbackAlert: boolean }>;   // fallback over 30 days; alert > 25% (ADR 0001)
+  byProject: Record<string, { cloudTokens: number; localTokens: number; calls: number; secs: number }>;
   byDay: { day: string; cloudTokens: number; localTokens: number }[];   // last 14 days
 }
 
@@ -76,7 +83,8 @@ export interface StudioState {
 // GET  /api/usage                 -> Usage
 // GET  /api/gpu                   -> Gpu            (poll every 3 s while visible)
 // POST /api/control               {action:'pause'|'resume', team?:'eng'|'rd'|'creative'} -> Control
-// POST /api/gates/:runId          {decision:'approve'|'reject', note?:string} -> {ok:true} (engine continues in background)
+// POST /api/gates/:runId          {decision:'approve'|'park'|'reject', items?:Record<itemId,GateDecision>, note?:string} -> {ok:true} (engine continues in background)
+//                                 with items, decision is optional and the outcome is derived (any approve -> approve, else any park -> park, else reject)
 // POST /api/runs/:runId/resume    -> {ok:true}
 // GET  /api/file?path=<repo-relative .md>  -> text/plain (only docs/**, .studio/checkpoints/** ; for gate review)
 // GET  /portraits/<file>          -> image
@@ -89,7 +97,7 @@ export const api = {
   file: (p: string): Promise<string> => fetch('/api/file?path=' + encodeURIComponent(p)).then((r) => r.text()),
   control: (action: 'pause' | 'resume', team?: string): Promise<Control> =>
     fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, team }) }).then((r) => r.json()),
-  gate: (runId: string, decision: 'approve' | 'reject', note = '') =>
-    fetch('/api/gates/' + encodeURIComponent(runId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, note }) }).then((r) => r.json()),
+  gate: (runId: string, decision: GateDecision | undefined, note = '', items?: Record<string, GateDecision>) =>
+    fetch('/api/gates/' + encodeURIComponent(runId), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ decision, note, items }) }).then((r) => r.json()),
   resume: (runId: string) => fetch('/api/runs/' + encodeURIComponent(runId) + '/resume', { method: 'POST' }).then((r) => r.json()),
 };
