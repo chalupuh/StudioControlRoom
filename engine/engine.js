@@ -128,24 +128,38 @@ function parseRunOutput(r) {
   };
 }
 
+// Env for a local (Ollama) tier. Claude Code does not know the local model, so it assumes a 200k window
+// and never compacts, while Ollama serves only `contextLength` tokens (32k default). Past that, Ollama
+// truncates the prompt and stops after a few tokens with max_tokens, which Claude Code reports as
+// "exceeded the 32000 output token maximum" — every long local stage failed this way on 2026-11-09.
+// Telling Claude Code the real window makes it auto-compact in time; the output cap leaves room for the reply.
+const LOCAL_CONTEXT_DEFAULT = 32768;
+function localTierEnv(tier, machineCfg = {}) {
+  const o = machineCfg.ollama || {};
+  const ctx = Number(o.contextLength) || LOCAL_CONTEXT_DEFAULT;
+  const maxOut = Number(o.maxOutputTokens) || Math.min(8192, Math.floor(ctx / 4));
+  return {
+    ANTHROPIC_BASE_URL: o.url || 'http://127.0.0.1:11434', ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+    ANTHROPIC_MODEL: tier.model, ANTHROPIC_DEFAULT_OPUS_MODEL: tier.model, ANTHROPIC_DEFAULT_SONNET_MODEL: tier.model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3:4b', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(ctx), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOut),
+  };
+}
+
 // ---- run one agent stage on a given tier ----
 function runAgent(stage, tierName, vars, feedback, reworkNote) {
   const tier = TIERS[tierName];
   const env = { ...process.env };
+  const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
   // Headless Claude Code on Windows needs Git Bash for its Bash tool; without this, agents have
   // no shell (can't run builds/tests) — found 2026-11-07 when QA couldn't run `npm run build`.
   // Resolution order: env STUDIO_GIT_BASH → .studio/machine.json gitBash → system default.
   if (process.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
-    const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
     const candidates = [process.env.STUDIO_GIT_BASH, machineCfg.gitBash, 'C:\\Program Files\\Git\\bin\\bash.exe'];
     const found = candidates.find((p) => p && fs.existsSync(p));
     if (found) env.CLAUDE_CODE_GIT_BASH_PATH = found;
   }
-  if (tier.local) Object.assign(env, {
-    ANTHROPIC_BASE_URL: 'http://127.0.0.1:11434', ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
-    ANTHROPIC_MODEL: tier.model, ANTHROPIC_DEFAULT_OPUS_MODEL: tier.model, ANTHROPIC_DEFAULT_SONNET_MODEL: tier.model,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3:4b', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  });
+  if (tier.local) Object.assign(env, localTierEnv(tier, machineCfg));
   let prompt = fill(stage.task, vars);
   const cwd = workdir(vars);
   const logCmd = cwd === REPO ? 'node .studio/studio.js' : `node "${STUDIO}"`;
@@ -490,4 +504,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { advance, hooks, parseRunOutput, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { advance, hooks, localTierEnv, parseRunOutput, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
