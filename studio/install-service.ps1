@@ -4,20 +4,49 @@
 
 .DESCRIPTION
     Registers "StudioSupervisor" to run `node <repo>/studio/studio.js supervise`
-    at system startup (highest privileges, run whether user is logged on or not,
-    restart on failure every 1 min up to 999 times).  STUDIO_HOME is passed as an
-    environment variable on the task action.
+    at system startup (run whether user is logged on or not via S4U, restart on
+    failure every 1 min up to 999 times).  STUDIO_HOME is passed through a .cmd
+    wrapper so the supervisor sees the HQ checkout path.
 
     The supervisor's 60 s tick also runs a daily backup at 03:00 — no second task needed.
 
     -Uninstall    removes the task
     -WhatIf       dry-run (prints what would happen)
 #>
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [switch]$Uninstall,
+    # Explicit HQ checkout path; defaults to studio.home.json → StudioControlRoom root.
+    [string]$StudioHome
+)
+
 $ErrorActionPreference = 'Stop'
 
 $repo   = (Resolve-Path $PSScriptRoot\..).Path
 $script = Join-Path $PSScriptRoot 'studio.js'
+$wrapper = Join-Path $PSScriptRoot 'supervise.cmd'
 $task   = 'StudioSupervisor'
+
+# Resolve STUDIO_HOME: explicit param → studio.home.json → fallback to repo root.
+if (-not $StudioHome) {
+    try {
+        $homeJson = Join-Path $repo 'studio.home.json'
+        if (Test-Path $homeJson) {
+            $StudioHome = (Get-Content -Raw $homeJson | ConvertFrom-Json).home
+        }
+    } catch { }
+}
+if (-not $StudioHome) { $StudioHome = $env:STUDIO_HOME }
+if (-not $StudioHome) {
+    Write-Error "Cannot resolve STUDIO_HOME (the HQ checkout). Pass -StudioHome <path> or create studio.home.json."
+    exit 1
+}
+$resolved = (Resolve-Path -LiteralPath $StudioHome -ErrorAction SilentlyContinue).Path
+if (-not $resolved) {
+    Write-Error "Cannot resolve STUDIO_HOME: '$StudioHome' does not exist."
+    exit 1
+}
+$StudioHome = $resolved
 
 function Register-Task {
     $node = (Get-Command node.exe -ErrorAction Stop).Source
@@ -30,16 +59,18 @@ function Register-Task {
         -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
         -AllowHardTerminate
 
+    # Use the .cmd wrapper to set STUDIO_HOME as an env var before launching node.
     $action  = New-ScheduledTaskAction `
-        -Execute $node `
-        -Argument "$script supervise" `
-        -WorkingDirectory $repo `
-        -EnvironmentVariables @{ 'STUDIO_HOME' = $repo }
+        -Execute 'cmd.exe' `
+        -Argument "/c `"$wrapper`" `"$StudioHome`" `"$node`"" `
+        -WorkingDirectory $repo
 
     $trigger   = New-ScheduledTaskTrigger -AtStartup
+    # Run as the current user via S4U (no password stored, works whether logged on or not).
+    # Highest privileges apply to this user, never SYSTEM.
     $principal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
-        -LogonType ServiceAccount `
+        -UserId "$env:USERDOMAIN\$env:USERNAME" `
+        -LogonType S4U `
         -RunLevel Highest
 
     Register-ScheduledTask -TaskName $task `
@@ -51,34 +82,38 @@ function Register-Task {
         -Description "Studio Supervisor: keeps services up, resumes runs, daily backup at 03:00"
 
     Write-Host "Installed Scheduled Task '$task'  —  startup trigger, restart on failure (1 min x 999)."
-    Write-Host "  STUDIO_HOME = $repo"
+    Write-Host "  STUDIO_HOME = $StudioHome"
+    Write-Host "  Run-as      : $env:USERDOMAIN\$env:USERNAME (S4U, no password stored)"
 }
 
 function Uninstall-Task {
-    Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue |
-        Unregister-ScheduledTask -Confirm:$false
-    Write-Host "Uninstalled Scheduled Task '$task'."
+    $existing = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    if ($existing) {
+        $existing | Unregister-ScheduledTask -Confirm:$false
+        Write-Host "Uninstalled Scheduled Task '$task'."
+    } else {
+        Write-Host "Scheduled Task '$task' was not installed — nothing to remove."
+    }
 }
 
 # ---- CLI ----
-if ($args -contains '-Uninstall') {
-    if ($args -contains '-WhatIf') {
-        Write-Host "[WhatIf] Would uninstall Scheduled Task '$task'."
-    } else {
+if ($Uninstall) {
+    if ($PSCmdlet.ShouldProcess($task, 'Uninstall Scheduled Task')) {
         Uninstall-Task
+    } else {
+        Write-Host "[WhatIf] Would uninstall Scheduled Task '$task'."
     }
 } else {
-    if ($args -contains '-WhatIf') {
+    if ($PSCmdlet.ShouldProcess($task, 'Register Scheduled Task')) {
+        Register-Task
+    } else {
         $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
         if (-not $node) { $node = 'node.exe (from PATH)' }
         Write-Host "[WhatIf] Would register Scheduled Task '$task':"
         Write-Host "  Trigger   : At startup"
-        Write-Host "  Principal : SYSTEM (highest privileges, whether logged on or not)"
-        Write-Host "  Action    : $node $script  supervise"
-        Write-Host "  Env       : STUDIO_HOME=$repo"
+        Write-Host "  Principal : $env:USERDOMAIN\$env:USERNAME (S4U, no password)"
+        Write-Host "  Action    : $node via $wrapper (STUDIO_HOME=$StudioHome)  supervise"
         Write-Host "  Restart   : 1 min, up to 999 times"
         Write-Host "  Backup    : daily at 03:00 (inside the supervisor tick)"
-    } else {
-        Register-Task
     }
 }

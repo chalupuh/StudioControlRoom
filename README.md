@@ -28,17 +28,39 @@ node engine/engine.js status | approve <run> approve|reject "<note>" | resume <r
 ```
 Pipelines live in HQ (`tools/engine/pipelines/*.json`). `{{soft}}` in a pipeline expands to this repo's root.
 
-## Supervisor & Backup
+## Always-on host
+
+### Per-machine profile
+Copy one profile object from `studio/machine.example.json` to `.studio/machine.json` and tune values for your hardware (Ollama settings, GPU slots, Control Room port).
+The profile is merged over sensible defaults.
+
+### Supervisor
 ```
 node studio/studio.js supervise          # long-running: keep services up, resume runs, daily backup at 03:00
+```
+Log: `.studio/logs/supervisor.log` (rotated at 5 MB, 5 files kept).
+
+### Boot install (Windows)
+Registers a Scheduled Task **StudioSupervisor** (at startup, runs whether user is logged on or not, restarts on failure every 1 min up to 999 times).
+The task runs under your own account (S4U, no password stored) and sets `STUDIO_HOME` to your HQ checkout.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File studio\install-service.ps1       # install
+powershell -ExecutionPolicy Bypass -File studio\install-service.ps1 -Uninstall  # remove
+powershell -ExecutionPolicy Bypass -File studio\install-service.ps1 -WhatIf     # dry-run
+```
+To check the task is healthy:
+```powershell
+Get-ScheduledTask StudioSupervisor | Get-ScheduledTaskInfo
+```
+
+### Backup
+```
 node studio/studio.js backup             # on-demand backup now
 ```
-Installs a Windows Scheduled Task ("StudioSupervisor") to auto-start on boot:
-```powershell
-powershell -ExecutionPolicy Bypass -File studio\install-service.ps1     # install
-powershell -ExecutionPolicy Bypass -File studio\install-service.ps1 -Uninstall  # remove
-```
-Backups zip `runs/`, `checkpoints/`, `roster.json`, `events.jsonl`, and `docs/internal/` into `.studio/backups/<date>.zip`, keeping the 14 most recent.
+The supervisor also runs a backup once per day at 03:00 local time.
+Backups zip `.studio/runs/`, `.studio/checkpoints/`, `roster.json`, `events.jsonl`, and `docs/internal/`
+into `.studio/backups/<YYYY-MM-DD>.zip`, keeping the 14 most recent.
 
 ## Development
 Branch, open a PR, CI must pass, then squash merge (see HQ ADR 0002). Tests: `npm --prefix studio/app test` and `node engine/test.js`.

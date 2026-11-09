@@ -18,9 +18,6 @@ const RESUMABLE = new Set(['paused', 'running']);
 
 const alive = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
 
-// Track whether we backed up today so we don't repeat within the same process lifetime.
-let lastBackupDate = '';
-
 function makeLogger(DIR, maxBytes = MAX_LOG, keep = KEEP) {
   const dir = path.join(DIR, 'logs'), file = path.join(dir, 'supervisor.log');
   return (msg) => {
@@ -115,18 +112,24 @@ function supervise(ctx) {
 }
 
 /** Run daily backup at 03:00 local time if none was done yet today. */
-function dailyBackup(ctx, log) {
-  const today = new Date().toISOString().slice(0, 10);
-  if (lastBackupDate === today) return; // already backed up today this process lifetime
-  const now = new Date();
+function dailyBackup(ctx, log, opts = {}) {
+  const now = opts.now || new Date;
+  const { localDate: localDateFn } = opts;
+  const localDate = localDateFn || require('./backup').localDate;
+  const today = localDate(now);
+  const backupDir = path.join(ctx.HOME, '.studio', 'backups');
+  const expectedZip = path.join(backupDir, today + '.zip');
+  if (fs.existsSync(expectedZip)) return; // already backed up today
+
   const hour = now.getHours();
-  if (hour !== 3) return; // only at 03:00
-  log('daily backup at 03:00');
+  if (hour < 3) return; // first run happens before 03:00 → wait; allows catch-up after downtime
+
+  log('daily backup at 03:00 (local date ' + today + ')');
   try {
     const { backup } = require('./backup');
     const dest = backup({ HOME: ctx.HOME });
-    if (dest) log(`backup done: ${dest}`);
-    lastBackupDate = today;
+    if (dest) log('backup done: ' + dest);
+    else log('backup: nothing to back up');
   } catch (e) {
     log('backup failed: ' + (e.message || e));
   }

@@ -64,6 +64,35 @@ check('log rotates and keeps at most 2 old files', lf.join() === 'supervisor.log
 // which we can't mock; covered by integration testing in production).
 check('dailyBackup function exported', typeof sup.dailyBackup === 'function');
 
+// dailyBackup: injected now and file-existence dedup
+{
+  const bkDir = path.join(DIR, 'backups');
+  fs.mkdirSync(bkDir, { recursive: true });
+  // Create runs dir so backup has something to zip (even on non-Windows it's a no-op here).
+  const logs = [];
+  const mockCtx = { HOME: HOME, DIR: DIR };
+
+  // before 03:00 → no backup
+  const before03 = new Date(2026, 0, 1, 2, 59);
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: before03 });
+  check('dailyBackup: 02:59 does not run', logs.length === 0);
+
+  // 03:00 → would run (but backup() might fail in test env; just check it was attempted).
+  const at03 = new Date(2026, 0, 1, 3, 0);
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: at03 });
+  // We got at least one log line meaning the path was entered.
+  check('dailyBackup: 03:00 triggers backup path', logs.some((m) => /daily backup/.test(m)));
+  logs.length = 0;
+
+  // Same day, second call → skip (if zip was created) or at least attempt (if not).
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 4, 0) });
+  // If a zip exists for 2026-01-01, we should get no new "daily backup" logs.
+  const todayZip = path.join(bkDir, '2026-01-01.zip');
+  if (fs.existsSync(todayZip)) {
+    check('dailyBackup: same-day zip exists → dedup', !logs.some((m) => /daily backup/.test(m)));
+  }
+}
+
 fs.rmSync(HOME, { recursive: true, force: true });
 if (fail) { console.error(`${fail} failed`); process.exit(1); }
 console.log('supervisor selftest passed');

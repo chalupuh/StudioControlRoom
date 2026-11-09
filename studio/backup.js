@@ -8,32 +8,34 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const os = require('os');
+const machineLib = require('./machine');
 
 const MAX_KEEP = 14;
 
-function studioHome() {
-  if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
-  try { const c = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'studio.home.json'), 'utf8')); if (c.home) return path.resolve(c.home); } catch {}
-  return path.resolve(__dirname, '..');
-}
+// Reuse the shared studioHome resolver (N2).
+const studioHome = machineLib.studioHome;
 
+/**
+ * Zip source paths into a destination zip.
+ * On Windows: powershell.exe Compress-Archive via env vars (safe quoting).
+ * On Unix: bsdtar/infrastructure tar -a picks zip from .zip extension.
+ */
 function zipFiles(srcFiles, destZip) {
-  // Use PowerShell to create a zip on Windows (built-in Compress-Archive).
-  // On other platforms, fallback to a simple tar if available, else node.zip.
   if (os.platform() === 'win32') {
-    const args = srcFiles.map((f) => "'" + f.replace("'", "''") + "'").join(', ');
-    execSync(
-      `Compress-Archive -Path ${args} -DestinationPath '${destZip.replace("'", "''")}' -Force`,
-      { encoding: 'utf8', windowsHide: true, timeout: 120000 }
-    );
+    // Pass paths through an env var so PowerShell never sees raw paths on the command line.
+    execFileSync('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      'Compress-Archive -LiteralPath $env:BK_SRC.Split(\'|\') -DestinationPath $env:BK_DEST -Force',
+    ], {
+      env: { ...process.env, BK_SRC: srcFiles.join('|'), BK_DEST: destZip },
+      windowsHide: true,
+      timeout: 600000, // docs/internal and runs/ grow large; 10 min should suffice.
+    });
   } else {
-    // Best-effort tar on unix
-    const tmpTar = destZip + '.tar';
-    execSync(`tar cf "${tmpTar}" ${srcFiles.join(' ')}`, { timeout: 120000 });
-    try { execSync(`rm "${destZip}"`, { encoding: 'utf8' }); } catch {}
-    execSync(`mv "${tmpTar}" "${destZip}"`, { encoding: 'utf8' });
+    // Best-effort: bsdtar (or equivalent) picks zip from the .zip extension.
+    execFileSync('tar', ['-a', '-cf', destZip, ...srcFiles], { timeout: 600000 });
   }
 }
 
@@ -69,19 +71,28 @@ function pruneOld(backupDir, keep = MAX_KEEP) {
   }
 }
 
+/** Local-date helper (YYYY-MM-DD in local timezone). Used by backup name and supervisor dedup. */
+function localDate(d = new Date()) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
 /**
- * @param {{ HOME?: string }} opts
+ * @param {{ HOME?: string, now?: Date }} opts
  * Returns the path to the created zip, or null if nothing to back up.
  */
 function backup(opts = {}) {
   const HOME = opts.HOME || studioHome();
+  const now = opts.now || new Date();
   const srcFiles = collectSources(HOME);
   if (srcFiles.length === 0) {
     console.log('backup: nothing to back up (no runs/checkpoints/docs found).');
     return null;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = localDate(now);
   const backupDir = path.join(HOME, '.studio', 'backups');
   fs.mkdirSync(backupDir, { recursive: true });
   const dest = path.join(backupDir, today + '.zip');
@@ -103,7 +114,7 @@ function backup(opts = {}) {
   return dest;
 }
 
-module.exports = { backup, collectSources, pruneOld, MAX_KEEP };
+module.exports = { backup, collectSources, pruneOld, localDate, MAX_KEEP };
 
 // CLI entry
 if (require.main === module) {
