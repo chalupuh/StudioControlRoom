@@ -13,6 +13,7 @@ const SUITES = [
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
+  { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
 ];
 
 let anyFailed = false;
