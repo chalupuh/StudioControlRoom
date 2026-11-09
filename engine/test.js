@@ -15,6 +15,7 @@ const SUITES = [
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
   { file: 'selftest-filepath.js',     label: '/api/file path resolution (gate links)' },
+  { file: 'selftest-local-env.js',    label: 'local tier context window env' },
 ];
 
 let anyFailed = false;
