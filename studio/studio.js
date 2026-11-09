@@ -8,10 +8,12 @@
 //   node .studio/studio.js checkpoint <agent> "<where>" "<next>" ["<files>"]
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
 //   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
+//   node studio/studio.js token [rotate]                  <- show current token / rotate it
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const os = require('os');
+const crypto = require('crypto');
 
 // Auth: extracted to testable module; studio-local functions delegate to it.
 const auth = require('./auth');
@@ -198,86 +200,73 @@ function parseEvents(text) {
 function readEvents() { return fs.existsSync(LOG) ? parseEvents(fs.readFileSync(LOG, 'utf8')) : []; }
 
 // ---- Auth token ----
-const AUTH_FILE = path.join(DIR, 'auth.json');
-function readAuth() { try { return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8')); } catch { return null; } }
-function writeAuth(a) { fs.writeFileSync(AUTH_FILE, JSON.stringify(a, null, 2)); }
-function generateToken() { return crypto.randomBytes(24).toString('hex'); }
-function ensureToken() {
-  let a = readAuth();
-  if (!a || !a.token) {
-    a = { token: generateToken(), created: Date.now() };
-    writeAuth(a);
-  }
-  return a;
-}
-function currentToken() { return readAuth()?.token || null; }
+function generateToken() { return auth.generateToken(); }
+function readAuth() { return auth.readAuth(DIR); }
+function writeAuth(a) { auth.writeAuth(DIR, a); }
+function ensureToken() { return auth.ensureToken(DIR); }
+function currentToken() { return auth.currentToken(DIR); }
 function verifyToken(provided) {
-  if (!provided) return false;
   const expected = currentToken();
   if (!expected) return false;
-  // constant-time comparison (timingSafeCompare removed in Node 24, use subtle)
-  return subtle.timingSafeCompare(
-    new Uint8Array(Buffer.from(provided)),
-    new Uint8Array(Buffer.from(expected))
-  );
+  return auth.verifyToken(provided, expected);
 }
 
 // ---- LAN bind address ----
+// Read machine.json profile (HOME/.studio/machine.json).
+function readMachineConfig() {
+  try { return JSON.parse(fs.readFileSync(path.join(DIR, 'machine.json'), 'utf8')); } catch { return {}; }
+}
+
 function getLanBind() {
-  // Respect STUDIO_BIND env; fall back to LAN address; last resort 127.0.0.1
+  // 1. STUDIO_BIND env var
   if (process.env.STUDIO_BIND) return process.env.STUDIO_BIND;
-  try {
-    const ifaces = os.networkInterfaces();
-    for (const name of Object.keys(ifaces)) {
-      for (const iface of ifaces[name]) {
-        if (iface.family === 'IPv4' && !iface.internal) return iface.address;
-      }
-    }
-  } catch {}
+  // 2. machine.json controlRoom.bind
+  const mc = readMachineConfig();
+  if (mc.controlRoom && mc.controlRoom.bind) return mc.controlRoom.bind;
+  // 3. default: loopback only
   return '127.0.0.1';
 }
 
-// ---- Rate limiter (per-IP, in-memory) ----
-// Windowed counters: tracks requests per 60 s window per IP key.
-const rateBuckets = new Map();
-const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT = 120;
-function rateLimitKey(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) return String(forwarded).split(',')[0].trim();
-  const socket = req.connection?.remoteAddress;
-  return socket ? socket.replace(/^::ffff:/, '') : 'unknown';
-}
-function checkRateLimit(ip) {
-  const now = Date.now();
-  let bucket = rateBuckets.get(ip);
-  if (!bucket || now - bucket.start > RATE_WINDOW_MS) {
-    bucket = { start: now, count: 0 };
-    rateBuckets.set(ip, bucket);
-  }
-  bucket.count++;
-  // prune old buckets every check
-  if (rateBuckets.size > 500) {
-    for (const [k, v] of rateBuckets) { if (now - v.start > RATE_WINDOW_MS) rateBuckets.delete(k); }
-  }
-  return bucket.count <= RATE_LIMIT;
-}
+// ---- Auth state ----
+const rateStore = auth.createRateStore();
+let _isLanMode = false;
 
-// ---- Auth middleware factory ----
-// Returns (req, res) => true|false. false = wrote 401/429 and ended response.
-function makeAuthMiddleware(json, text) {
+// ---- Auth middleware ----
+// Returns (req, res) => true|false. false = wrote 401/429/403 and ended response.
+// Loops back (127.0.0.1/::1) always skip auth. Non-private IPs get 403.
+function makeAuthMiddleware(json) {
   return (req, res) => {
-    const ip = rateLimitKey(req);
-    if (!checkRateLimit(ip)) {
+    const ip = auth.rateLimitKey(req);
+
+    // loopback always skips auth
+    if (ip === '127.0.0.1' || ip === '::1') return true;
+
+    // reject non-private source IPs with 403
+    if (!auth.isPrivateIP(ip)) {
+      json(res, { error: 'forbidden' }, 403);
+      return false;
+    }
+
+    // rate limit: 5 failed attempts per IP per 60 s
+    if (!auth.checkRateLimit(ip, rateStore)) {
       json(res, { error: 'rate limited' }, 429);
       return false;
     }
-    const token = req.headers['authorization']?.replace(/^Bearer\s+/i, '')
-      || new URL(req.url, 'http://x').searchParams.get('token');
+
+    // extract token from Bearer header or HttpOnly cookie
+    let token = req.headers['authorization']?.replace(/^Bearer\s+/i, '');
+    if (!token) {
+      const cookies = auth.parseCookies(req.headers['cookie'] || '');
+      token = cookies.studio_token || null;
+    }
+
     if (!verifyToken(token)) {
       json(res, { error: 'unauthorized' }, 401);
       return false;
     }
+
+    // success: reset failure counter
+    auth.resetRateLimit(ip, rateStore);
     return true;
   };
 }
@@ -395,7 +384,7 @@ function startWatchers() {
   setInterval(() => { for (const c of clients) { try { c.write(': hb\n\n'); } catch {} } }, 15000).unref?.();
 }
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.json': 'application/json', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.map': 'application/json' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.json': 'application/json', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.map': 'application/json' };
 function sendFile(res, file, extraHeaders = {}) {
   const ext = path.extname(file).toLowerCase();
   res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', ...extraHeaders });
@@ -434,12 +423,38 @@ function serve(port = 4777) {
   const html = path.join(SOFT, 'dashboard.html');
   const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   const text = (res, s, code = 200) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(s); };
-  const auth = makeAuthMiddleware(json, text);
+
+  // Determine bind address and LAN mode
+  const bindAddr = getLanBind();
+  _isLanMode = (bindAddr !== '127.0.0.1' && bindAddr !== '::1');
+
+  // Ensure token exists when in LAN mode
+  if (_isLanMode) ensureToken();
+
+  const authMiddleware = makeAuthMiddleware(json);
   startWatchers();
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname, m = req.method;
+
+    // ---- /pair: validate token, set HttpOnly cookie, redirect to / ----
+    if (p === '/pair' && m === 'GET') {
+      const tParam = url.searchParams.get('t');
+      if (tParam && verifyToken(tParam)) {
+        res.writeHead(302, {
+          'Location': '/',
+          'Set-Cookie': `studio_token=${tParam}; HttpOnly; SameSite=Strict; Path=/`,
+        });
+        res.end();
+        return;
+      }
+      // If no token or invalid token: in LAN mode, 401; loopback, redirect anyway
+      if (_isLanMode) return json(res, { error: 'unauthorized' }, 401);
+      res.writeHead(302, { 'Location': '/' });
+      res.end();
+      return;
+    }
 
     // ---- legacy endpoints (used by dashboard.html) ----
     if (p === '/control') {
@@ -456,65 +471,68 @@ function serve(port = 4777) {
     if (p === '/events') return json(res, readEvents());
     if (p === '/v1') return sendFile(res, html, { 'Cache-Control': 'no-store' });
 
-    // ---- v2 API ----
-    if (p === '/api/pair' && m === 'POST') {
-      ensureToken();
-      return json(res, { token: currentToken(), method: 'bearer' });
+    // ---- v2 API (auth required when in LAN mode) ----
+    if (p.startsWith('/api/')) {
+      if (_isLanMode && !authMiddleware(req, res)) return;
+      if (p === '/api/state' && m === 'GET') return json(res, getState());
+      if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
+      if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
+      if (p === '/api/stream' && m === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+        res.write(': connected\n\n');
+        clients.add(res);
+        req.on('close', () => clients.delete(res));
+        return;
+      }
+      if (p === '/api/shutdown' && m === 'POST') {
+        // One-shot Game mode: run in a detached process so it can also stop this server at the end.
+        const out = fs.openSync(path.join(DIR, 'shutdown.log'), 'a');
+        require('child_process').spawn(process.execPath, [path.join(SOFT, 'studio.js'), 'shutdown'], { detached: true, windowsHide: true, stdio: ['ignore', out, out] }).unref();
+        return json(res, { ok: true, message: 'Shutting down: agents checkpoint, local models and ComfyUI stop, then this server stops.' });
+      }
+      if (p === '/api/control' && m === 'POST') {
+        const b = await readBody(req);
+        if (b.action !== 'pause' && b.action !== 'resume') return json(res, { error: 'action must be pause or resume' }, 400);
+        if (b.team != null && !TEAMS.includes(b.team)) return json(res, { error: 'team must be eng, rd or creative' }, 400);
+        return json(res, setControl(b.action === 'pause' ? 'paused' : 'running', 'dashboard', b.team || undefined));
+      }
+      let mt;
+      if (m === 'POST' && (mt = p.match(/^\/api\/gates\/([^/]+)$/))) {
+        const runId = decodeURIComponent(mt[1]);
+        if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
+        const b = await readBody(req);
+        if (b.decision !== 'approve' && b.decision !== 'reject') return json(res, { error: 'decision must be approve or reject' }, 400);
+        const note = typeof b.note === 'string' ? b.note.slice(0, 2000) : '';
+        const run = readJson(path.join(RUNS, runId + '.json'), null);
+        if (!run) return json(res, { error: 'run not found' }, 404);
+        if (run.status !== 'waiting-gate') return json(res, { error: 'run is not waiting at a gate' }, 409);
+        spawnEngine(['approve', runId, b.decision, note], runId);
+        return json(res, { ok: true });
+      }
+      if (m === 'POST' && (mt = p.match(/^\/api\/runs\/([^/]+)\/resume$/))) {
+        const runId = decodeURIComponent(mt[1]);
+        if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
+        if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
+        spawnEngine(['resume', runId], runId);
+        return json(res, { ok: true });
+      }
+      if (p === '/api/file' && m === 'GET') {
+        const raw = url.searchParams.get('path') || '';
+        if (raw.includes('\0') || raw.includes('..') || raw.includes('\\') || path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) return text(res, 'forbidden', 403);
+        const norm = path.posix.normalize(raw);
+        if (!/\.md$/i.test(norm) || !(norm.startsWith('docs/') || norm.startsWith('.studio/checkpoints/'))) return text(res, 'forbidden', 403);
+        const full = path.resolve(REPO, norm);
+        if (!full.startsWith(REPO + path.sep)) return text(res, 'forbidden', 403);
+        if (!isFile(full)) return text(res, 'not found', 404);
+        return text(res, fs.readFileSync(full, 'utf8'));
+      }
+      // /api/test/reset-rate-limit: clear rate limiter (for selftests only)
+      if (p === '/api/test/reset-rate-limit' && m === 'POST') {
+        rateStore.clear();
+        return json(res, { ok: true });
+      }
+      return json(res, { error: 'not found' }, 404);
     }
-    if (p.startsWith('/api/') && p !== '/api/pair' && !auth(req, res)) return;
-    if (p === '/api/state' && m === 'GET') return json(res, getState());
-    if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
-    if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
-    if (p === '/api/stream' && m === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-      res.write(': connected\n\n');
-      clients.add(res);
-      req.on('close', () => clients.delete(res));
-      return;
-    }
-    if (p === '/api/shutdown' && m === 'POST') {
-      // One-shot Game mode: run in a detached process so it can also stop this server at the end.
-      const out = fs.openSync(path.join(DIR, 'shutdown.log'), 'a');
-      require('child_process').spawn(process.execPath, [path.join(SOFT, 'studio.js'), 'shutdown'], { detached: true, windowsHide: true, stdio: ['ignore', out, out] }).unref();
-      return json(res, { ok: true, message: 'Shutting down: agents checkpoint, local models and ComfyUI stop, then this server stops.' });
-    }
-    if (p === '/api/control' && m === 'POST') {
-      const b = await readBody(req);
-      if (b.action !== 'pause' && b.action !== 'resume') return json(res, { error: 'action must be pause or resume' }, 400);
-      if (b.team != null && !TEAMS.includes(b.team)) return json(res, { error: 'team must be eng, rd or creative' }, 400);
-      return json(res, setControl(b.action === 'pause' ? 'paused' : 'running', 'dashboard', b.team || undefined));
-    }
-    let mt;
-    if (m === 'POST' && (mt = p.match(/^\/api\/gates\/([^/]+)$/))) {
-      const runId = decodeURIComponent(mt[1]);
-      if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
-      const b = await readBody(req);
-      if (b.decision !== 'approve' && b.decision !== 'reject') return json(res, { error: 'decision must be approve or reject' }, 400);
-      const note = typeof b.note === 'string' ? b.note.slice(0, 2000) : '';
-      const run = readJson(path.join(RUNS, runId + '.json'), null);
-      if (!run) return json(res, { error: 'run not found' }, 404);
-      if (run.status !== 'waiting-gate') return json(res, { error: 'run is not waiting at a gate' }, 409);
-      spawnEngine(['approve', runId, b.decision, note], runId);
-      return json(res, { ok: true });
-    }
-    if (m === 'POST' && (mt = p.match(/^\/api\/runs\/([^/]+)\/resume$/))) {
-      const runId = decodeURIComponent(mt[1]);
-      if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
-      if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
-      spawnEngine(['resume', runId], runId);
-      return json(res, { ok: true });
-    }
-    if (p === '/api/file' && m === 'GET') {
-      const raw = url.searchParams.get('path') || '';
-      if (raw.includes('\0') || raw.includes('..') || raw.includes('\\') || path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) return text(res, 'forbidden', 403);
-      const norm = path.posix.normalize(raw);
-      if (!/\.md$/i.test(norm) || !(norm.startsWith('docs/') || norm.startsWith('.studio/checkpoints/'))) return text(res, 'forbidden', 403);
-      const full = path.resolve(REPO, norm);
-      if (!full.startsWith(REPO + path.sep)) return text(res, 'forbidden', 403);
-      if (!isFile(full)) return text(res, 'not found', 404);
-      return text(res, fs.readFileSync(full, 'utf8'));
-    }
-    if (p.startsWith('/api/')) return json(res, { error: 'not found' }, 404);
 
     if (p.startsWith('/portraits/') && m === 'GET') {
       const full = safeJoin(PORTRAITS, p.slice('/portraits/'.length));
@@ -539,12 +557,11 @@ function serve(port = 4777) {
 
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, '0.0.0.0', () => {
-    const lan = getLanBind();
+  }).listen(port, bindAddr, () => {
     try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {}
     console.log(`Studio dashboard: http://localhost:${port}`);
-    if (lan !== '127.0.0.1' && lan !== '::1') {
-      console.log(`LAN:            http://${lan}:${port}`);
+    if (_isLanMode) {
+      console.log(`LAN mode: authentication required. Token in ${path.join(DIR, 'auth.json')}`);
     }
   });
 }
@@ -559,15 +576,18 @@ else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
 else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
 else if (cmd === 'token') {
-  // Show current token or regenerate on --regen
-  const a = ensureToken();
-  console.log(`token: ${a.token}`);
-  if (rest.includes('--regen')) {
+  // token subcommands: show current token, or rotate (create/replace)
+  const sub = rest[0];
+  if (sub === 'rotate') {
     writeAuth({ token: generateToken(), created: Date.now() });
-    console.log(`NEW token: ${currentToken()}`);
+    console.log(`Token rotated.`);
+  } else {
+    // Show current token (create if missing)
+    const a = ensureToken();
+    console.log(`Token: ${a.token}`);
   }
 }
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | token [rotate]');
