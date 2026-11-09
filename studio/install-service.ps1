@@ -8,7 +8,7 @@
     failure every 1 min up to 999 times).  STUDIO_HOME is passed via the `--home`
     CLI argument, so the supervisor and all its children inherit the HQ checkout path.
 
-    The supervisor's 60 s tick also runs a daily backup at 03:00 — no second task needed.
+    The supervisor's 60 s tick also runs a daily backup at 03:00 -- no second task needed.
 
     -Uninstall    removes the task
     -WhatIf       dry-run (prints what it would do, builds the real action to validate)
@@ -20,7 +20,7 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$Uninstall,
-    # Explicit HQ checkout path; defaults to studio.home.json → $env:STUDIO_HOME.
+    # Explicit HQ checkout path; defaults to studio.home.json -> $env:STUDIO_HOME.
     [string]$StudioHome
 )
 
@@ -30,7 +30,7 @@ $repo   = (Resolve-Path $PSScriptRoot\..).Path
 $script = Join-Path $PSScriptRoot 'studio.js'
 $task   = 'StudioSupervisor'
 
-# Resolve STUDIO_HOME: explicit param → studio.home.json → $env:STUDIO_HOME → error.
+# Resolve STUDIO_HOME: explicit param -> studio.home.json -> $env:STUDIO_HOME -> error.
 if (-not $StudioHome) {
     try {
         $homeJson = Join-Path $repo 'studio.home.json'
@@ -85,7 +85,7 @@ function Register-Task {
         -Force `
         -Description "Studio Supervisor: keeps services up, resumes runs, daily backup at 03:00"
 
-    Write-Host "Installed Scheduled Task '$task'  —  startup trigger, restart on failure (1 min x 999)."
+    Write-Host "Installed Scheduled Task '$task'  --  startup trigger, restart on failure (1 min x 999)."
     Write-Host "  STUDIO_HOME = $StudioHome"
     Write-Host "  Run-as      : $env:USERDOMAIN\$env:USERNAME (S4U, no password stored)"
 }
@@ -96,7 +96,7 @@ function Uninstall-Task {
         $existing | Unregister-ScheduledTask -Confirm:$false
         Write-Host "Uninstalled Scheduled Task '$task'."
     } else {
-        Write-Host "Scheduled Task '$task' was not installed — nothing to remove."
+        Write-Host "Scheduled Task '$task' was not installed -- nothing to remove."
     }
 }
 

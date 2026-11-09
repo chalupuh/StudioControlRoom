@@ -15,7 +15,7 @@ const http = require('http');
 
 // SOFT = where this software lives (dashboard.html, app-dist). HOME = the org workspace (agents, docs,
 // runtime data in HOME/.studio). They are the same folder today; after the StudioControlRoom split they differ.
-// HOME: --home CLI arg → STUDIO_HOME env → studio.home.json next to the software → error (no repo-root fallback for supervise/backup).
+// HOME: --home CLI arg → STUDIO_HOME env → studio.home.json next to the software → error (no repo-root fallback).
 const SOFT = __dirname;
 
 /* Parse --home <path> from argv and set STUDIO_HOME so children inherit it.
@@ -28,9 +28,12 @@ const SOFT = __dirname;
   }
 })();
 
-function studioHome() {
+/** Resolve HOME. If strict is true (for supervise/backup), exit 1 if HOME cannot be resolved. */
+function studioHome(strict) {
   if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
   try { const c = JSON.parse(fs.readFileSync(path.join(SOFT, '..', 'studio.home.json'), 'utf8')); if (c.home) return path.resolve(c.home); } catch {}
+  if (strict) { console.error('Cannot resolve STUDIO_HOME. Pass --home <path>, set STUDIO_HOME, or create studio.home.json.'); process.exit(1); }
+  // Non-strict fallback (for serve, hook, etc. — safe for dashboard).
   return path.resolve(SOFT, '..');
 }
 const HOME = studioHome();
@@ -420,6 +423,21 @@ function serve(port = MACHINE.controlRoom.port) {
       const runId = decodeURIComponent(mt[1]);
       if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
       if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
+      // S3: check lock before spawning — prevent double engine on same run
+      const lockFile = path.join(DIR, 'locks', runId + '.lock');
+      try {
+        const raw = fs.readFileSync(lockFile, 'utf8');
+        let lockPid;
+        try { lockPid = JSON.parse(raw).pid; } catch { lockPid = Number(raw); }
+        if (lockPid) {
+          let live = true;
+          try { process.kill(lockPid, 0); } catch (e) { live = e.code === 'EPERM'; } // ESRCH = stale lock
+          if (live) return json(res, { error: 'run already running', running: true }, 409);
+        }
+      } catch (e) {
+        if (e.code !== 'ENOENT' && e.code !== 'EACCES') return json(res, { error: 'lock check failed' }, 500);
+        // No lock file — ok to proceed
+      }
       spawnEngine(['resume', runId], runId);
       return json(res, { ok: true });
     }
@@ -456,9 +474,17 @@ function serve(port = MACHINE.controlRoom.port) {
     return sendFile(res, index, { 'Cache-Control': 'no-cache' });
   }
 
+  // S11: refuse non-loopback bind — prevent accidentally exposing the dashboard
+  const bindAddr = MACHINE.controlRoom.bind || '127.0.0.1';
+  const isLoopback = ['127.0.0.1', '::1', 'localhost'].includes(bindAddr);
+  if (!isLoopback) {
+    console.error(`Refusing to bind to ${bindAddr}: only loopback addresses allowed. Set machine.json controlRoom.bind to 127.0.0.1 or ::1.`);
+    process.exit(1);
+  }
+
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, MACHINE.controlRoom.bind, () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
+  }).listen(port, bindAddr, () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -472,10 +498,11 @@ else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
 else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || MACHINE.controlRoom.port);
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
-else if (cmd === 'supervise') require('./supervisor').supervise({ HOME, DIR, getControl, append });
+else if (cmd === 'supervise') { const h = studioHome(true); require('./supervisor').supervise({ HOME: h, DIR: path.join(h, '.studio'), getControl, append }); }
 else if (cmd === 'backup') {
+  const h = studioHome(true);
   const { backup } = require('./backup');
-  backup({ HOME }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } }).catch((e) => { console.error(e); process.exit(1); });
+  backup({ HOME: h }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } }).catch((e) => { console.error(e); process.exit(1); });
 }
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
 else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | supervise | backup');

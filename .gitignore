@@ -10,3 +10,6 @@ studio.home.json
 *.log
 *.part
 temp_*
+
+# runtime data of a stray local HOME
+.studio/

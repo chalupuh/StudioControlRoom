@@ -7,6 +7,12 @@
 // Invoked by the supervisor once a day at 03:00, or on-demand from CLI.
 // Uses a stage-then-zip pattern: copy sources to a temp dir (fs.cpSync handles
 // files held open for append), zip the staging dir, then remove it in finally.
+//
+// Archive layout preserves parent directories (.studio/ and docs/) so the zip
+// can be restored with Expand-Archive <zip> -DestinationPath <HQ>.
+//
+// S6: Writes .partial first, renames on success, deletes .partial in finally.
+// S7: async function with try/finally to avoid leaking staging on early throw.
 
 const fs = require('fs');
 const path = require('path');
@@ -22,25 +28,27 @@ const studioHome = machineLib.studioHome;
 /**
  * Zip source paths into a destination zip.
  * On Windows: powershell.exe Compress-Archive with $ErrorActionPreference='Stop'.
- * On Unix: bsdtar picks zip from .zip extension.
+ * On Unix: tar -C staging for correct archive layout.
  * Returns a Promise for async use by the supervisor.
  */
 function zipFiles(srcFiles, destZip) {
   return new Promise((resolve, reject) => {
     const cb = (err) => { if (err) reject(err); else resolve(); };
     if (os.platform() === 'win32') {
-      // Pass paths through an env var so PowerShell never sees raw paths on the command line.
-      // Prefix with 'Stop' so a partial archive produces a non-zero exit.
-      execFile('powershell.exe', [
-        '$ErrorActionPreference=\'Stop\'; Compress-Archive -LiteralPath $env:BK_SRC.Split(\'|\') -DestinationPath $env:BK_DEST -Force',
-      ], {
-        env: { ...process.env, BK_SRC: srcFiles.join('|'), BK_DEST: destZip },
+      // srcFiles[0] is the staging dir; zip its CONTENTS (any extension works, unlike Compress-Archive,
+      // which rejects '.partial'). Paths go through env vars; 'Stop' makes failures exit non-zero.
+      const ps = "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+        + "if (Test-Path -LiteralPath $env:BK_DEST) { Remove-Item -LiteralPath $env:BK_DEST -Force }; "
+        + "[System.IO.Compression.ZipFile]::CreateFromDirectory($env:BK_SRC, $env:BK_DEST, [System.IO.Compression.CompressionLevel]::Optimal, $false)";
+      execFile('powershell.exe', ['-NoProfile', '-Command', ps], {
+        env: { ...process.env, BK_SRC: srcFiles[0], BK_DEST: destZip },
         windowsHide: true,
         timeout: 600000, // docs/internal and runs/ grow large; 10 min should suffice.
       }, cb);
     } else {
-      // bsdtar (or equivalent) picks zip from the .zip extension.
-      execFile('tar', ['-a', '-cf', destZip, ...srcFiles], { timeout: 600000 }, cb);
+      // Use -C staging so entries start with .studio/ and docs/ (not /tmp/studio-backup-...).
+      const staging = srcFiles[0];
+      execFile('tar', ['-C', staging, '-a', '-cf', destZip, '.studio', 'docs'], { timeout: 600000 }, cb);
     }
   });
 }
@@ -91,51 +99,84 @@ function localDate(d = new Date()) {
  *
  * Stage-then-zip: copies sources to a temp dir so files held open for append
  * (e.g., runs/<id>.log while an engine is running) can be copied successfully.
+ *
+ * S6: Writes to .partial first, renames to final .zip on success.
+ * S7: async with try/finally so staging is always cleaned up even on early throw.
+ * S8: Stages under .studio/ and docs/ parents so the archive restores cleanly.
  */
-function backup(opts = {}) {
+async function backup(opts = {}) {
   const HOME = opts.HOME || studioHome();
   const now = opts.now || new Date();
   const srcFiles = collectSources(HOME);
   if (srcFiles.length === 0) {
     console.log('backup: nothing to back up (no runs/checkpoints/docs found).');
-    return Promise.resolve(null);
+    return null;
   }
 
   const today = localDate(now);
   const backupDir = path.join(HOME, '.studio', 'backups');
   fs.mkdirSync(backupDir, { recursive: true });
   const dest = path.join(backupDir, today + '.zip');
+  // S6: write to .partial first, rename on success
+  const partial = dest + '.partial';
 
-  // Stage sources to a temp directory — fs.cpSync handles files held open for append.
-  const staging = path.join(os.tmpdir(), `studio-backup-${Date.now()}`);
-  fs.mkdirSync(staging, { recursive: true });
-  for (const src of srcFiles) {
-    const name = path.basename(src);
-    fs.cpSync(src, path.join(staging, name), { recursive: true });
-  }
+  // S7: staging dir created inside the async function, cleaned up in finally
+  const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-backup-'));
+  try {
+    // S8: stage under .studio/ and docs/ parent directories
+    const stagingStudio = path.join(staging, '.studio');
+    const stagingDocs = path.join(staging, 'docs');
+    fs.mkdirSync(stagingStudio, { recursive: true });
+    fs.mkdirSync(stagingDocs, { recursive: true });
 
-  console.log(`backup: creating ${dest}`);
-  console.log(`backup: sources: ${srcFiles.join(', ')}`);
+    const studioItems = ['runs', 'checkpoints'];
+    for (const item of studioItems) {
+      const src = path.join(HOME, '.studio', item);
+      try { fs.cpSync(src, path.join(stagingStudio, item), { recursive: true }); } catch {}
+    }
+    // Flat files under .studio/
+    for (const file of ['roster.json', 'events.jsonl']) {
+      const src = path.join(HOME, '.studio', file);
+      try { fs.copyFileSync(src, path.join(stagingStudio, file)); } catch {}
+    }
+    // docs/internal
+    const docsSrc = path.join(HOME, 'docs', 'internal');
+    try { fs.cpSync(docsSrc, path.join(stagingDocs, 'internal'), { recursive: true }); } catch {}
 
-  return zipFiles([staging], dest).then(() => {
-    // Verify
-    const sz = fs.statSync(dest).size;
+    console.log(`backup: creating ${dest}`);
+    console.log(`backup: sources: ${srcFiles.join(', ')}`);
+
+    // S6: zip to .partial
+    await zipFiles([staging], partial); // zips staging contents: entries start with .studio/ and docs/
+
+    // Verify partial was created and has content
+    const sz = fs.statSync(partial).size;
+    if (sz === 0) {
+      throw new Error('backup: created archive is empty');
+    }
+
+    // Rename .partial to final .zip
+    fs.renameSync(partial, dest);
     console.log(`backup: ${dest} (${sz.toLocaleString()} bytes)`);
 
-    // Prune old backups
+    // Prune old backups (only count real .zip files, not .partial)
     const before = fs.readdirSync(backupDir).filter((f) => f.endsWith('.zip')).length;
     pruneOld(backupDir);
     const after = fs.readdirSync(backupDir).filter((f) => f.endsWith('.zip')).length;
     if (before > MAX_KEEP) console.log(`backup: pruned ${before - after} old backup(s), keeping ${MAX_KEEP}`);
 
     return dest;
-  }).finally(() => {
-    // Always clean up staging directory after zip completes
+  } catch (e) {
+    // S6: clean up partial on failure
+    try { fs.unlinkSync(partial); } catch {}
+    throw e;
+  } finally {
+    // S7: always clean up staging directory
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
-  });
+  }
 }
 
-module.exports = { backup, collectSources, pruneOld, localDate, MAX_KEEP };
+module.exports = { backup, collectSources, pruneOld, localDate, MAX_KEEP, zipFiles };
 
 // CLI entry
 if (require.main === module) {

@@ -16,6 +16,7 @@ const SUITES = [
   { file: 'selftest-machine.js',      label: 'per-machine profile (machine.json)' },
   { file: 'selftest-supervisor.js',   label: 'supervisor (resume paused, skip blocked, no double start)' },
   { file: 'selftest-backup.js',       label: 'backup (collect sources, prune old zips)' },
+  { file: 'selftest-ps1-ascii.js',    label: 'ps1/cmd files are ASCII-only (PowerShell 5.1 compat)' },
 ];
 
 let anyFailed = false;

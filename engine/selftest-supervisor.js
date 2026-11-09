@@ -24,6 +24,7 @@ const deps = {
   spawnEngine: (h, id) => { spawned.push(id); const pid = nextPid++; livePids.add(pid); return pid; },
   isAlive: (pid) => livePids.has(pid),
   engineAlive: () => false,
+  liveCount: 0, // ignore real engines on the dev machine
 };
 
 // Paused switch: services only
@@ -54,6 +55,30 @@ fs.rmSync(path.join(DIR, 'locks'), { recursive: true, force: true });
 sup.tick(ctx, { ...deps, engineAlive: () => true });
 check('live engine process (no lock) is not duplicated', spawned.length === 4);
 
+// S1: team-paused run is not resumed
+{
+  const before = spawned.length;
+  fs.rmSync(path.join(DIR, 'locks'), { recursive: true, force: true });
+  fs.writeFileSync(path.join(DIR, 'roster.json'), JSON.stringify({ agents: { 'image-artist': { team: 'creative' } } }));
+  for (const f of fs.readdirSync(path.join(DIR, 'runs'))) fs.unlinkSync(path.join(DIR, 'runs', f));
+  fs.writeFileSync(path.join(DIR, 'runs', 'r-team.json'), JSON.stringify({ id: 'r-team', status: 'paused', cursor: 0, stages: [{ agent: 'image-artist' }] }));
+  sup.tick({ ...ctx, getControl: () => ({ state: 'running', teams: { creative: 'paused' } }) }, deps);
+  check('S1: team-paused run is not resumed', spawned.length === before);
+  sup.tick(ctx, deps);
+  check('S1: resumed once the team is running', spawned.length === before + 1);
+}
+
+// S2: concurrency cap and crash-loop guard
+{
+  const before = spawned.length;
+  fs.rmSync(path.join(DIR, 'locks'), { recursive: true, force: true });
+  sup.tick(ctx, { ...deps, liveCount: 2 });
+  check('S2: concurrency cap (2 live engines) blocks new resumes', spawned.length === before);
+  for (let i = 0; i < 4; i++) { livePids.clear(); sup.tick(ctx, deps); }
+  const run = JSON.parse(fs.readFileSync(path.join(DIR, 'runs', 'r-team.json'), 'utf8'));
+  check('S2: crash loop (3 resumes, same cursor) blocks the run', run.status === 'blocked' && /resume loop/.test(run.blockedReason));
+}
+
 // Log rotation
 const log = sup.makeLogger(DIR, 200, 2);
 for (let i = 0; i < 40; i++) log('line ' + i + ' ' + 'x'.repeat(30));
@@ -69,7 +94,7 @@ check('log rotates and keeps at most 2 old files', lf.join() === 'supervisor.log
 
   let backupCallCount = 0;
   const mockBackup = () => { backupCallCount++; return Promise.resolve(null); };
-  const mockLocalDate = (d) => sup.dailyBackup.toString().includes('localDate') ? require('../studio/backup').localDate(d) : '2026-01-01';
+  const mockLocalDate = require('../studio/backup').localDate;
 
   // before 03:00 → no backup
   const before03 = new Date(2026, 0, 1, 2, 59);
@@ -83,7 +108,7 @@ check('log rotates and keeps at most 2 old files', lf.join() === 'supervisor.log
   logs.length = 0;
 
   // 03:01 → within 60 min of last attempt → skipped (hourly retry guard)
-  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 3, 1) });
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 3, 1), backup: mockBackup, localDate: mockLocalDate });
   check('dailyBackup: 03:01 skipped (within 1 h)', !logs.some((m) => /daily backup/.test(m)) && backupCallCount === 1);
 
   // 04:01 → more than 60 min → retry

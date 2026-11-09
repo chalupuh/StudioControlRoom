@@ -62,9 +62,9 @@ Get-Content <HQ>\.studio\logs\supervisor.log -Tail 3
 ```
 The last line should show `supervisor started (pid ..., every 60 s)`.
 
-**S4U limitations:** S4U (Security Support Provider Interface) has no network credentials, no DPAPI access, and no Credential Manager access. Commands like `git push` through GCM, `gh`, or SMB shares will fail under the scheduled task. If you need network auth, reinstall with `-LogonType Password` and use `Get-Credential` interactively.
+**S4U limitations:** S4U (Service for User) has no network credentials, no DPAPI access, and no Credential Manager access. Commands like `git push` through GCM, `gh`, or SMB shares will fail under the scheduled task. If you need network auth, change the task's logon to a stored password by hand in Task Scheduler (task properties, General).
 
-**Elevation note:** Every LLM agent spawned by the supervisor inherits the owner's elevated admin token due to `-RunLevel Highest`. If you prefer least privilege, remove `-RunLevel Highest` from `install-service.ps1` after editing.
+**Elevation note:** Every LLM agent spawned by the supervisor inherits the owner's elevated admin token due to `-RunLevel Highest`. If you prefer least privilege, change the task to "Run with highest privileges" off in Task Scheduler (task properties, General).
 
 > The `.studio/` directory referenced here means the **HQ checkout's** `.studio/`, not this repo's `.studio/`.
 
@@ -76,6 +76,11 @@ The supervisor also runs a backup once per day at 03:00 local time.
 Backups use a stage-then-zip pattern: sources are copied to a temp directory (handling files held open by active engines), then zipped.
 Backups zip `.studio/runs/`, `.studio/checkpoints/`, `roster.json`, `events.jsonl`, and `docs/internal/`
 into `.studio/backups/<YYYY-MM-DD>.zip`, keeping the 14 most recent.
+The zip is written as `<date>.zip.partial` and renamed on success, so a failed run never counts as that day's backup.
+`supervise` and `backup` refuse to run when `STUDIO_HOME` cannot be resolved.
+
+**Restore:** `Expand-Archive <zip> -DestinationPath <HQ>` (the archive holds `.studio/...` and `docs/internal/...`).
+
 A failed backup is retried hourly (not daily); `.studio/backups/.last-attempt` tracks the last attempt timestamp.
 
 ## Development
