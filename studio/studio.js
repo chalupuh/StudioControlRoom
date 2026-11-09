@@ -475,8 +475,7 @@ else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'supervise') require('./supervisor').supervise({ HOME, DIR, getControl, append });
 else if (cmd === 'backup') {
   const { backup } = require('./backup');
-  const dest = backup({ HOME });
-  if (!dest) { console.error('backup: nothing to back up'); process.exit(1); }
+  backup({ HOME }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } }).catch((e) => { console.error(e); process.exit(1); });
 }
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
 else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | supervise | backup');
