@@ -15,6 +15,10 @@ const SUITES = [
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
   { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
+  { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
+  { file: 'selftest-filepath.js',     label: '/api/file path resolution (gate links)' },
+  { file: 'selftest-local-env.js',    label: 'local tier context window env' },
+  { file: 'selftest-recurring.js',    label: 'usage-limit waits, misplaced reports, stale rules, headless permissions' },
 ];
 
 let anyFailed = false;

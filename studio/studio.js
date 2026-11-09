@@ -561,12 +561,9 @@ function serve(port = 4777) {
         return json(res, { ok: true });
       }
       if (p === '/api/file' && m === 'GET') {
-        const raw = url.searchParams.get('path') || '';
-        if (raw.includes('\0') || raw.includes('..') || raw.includes('\\') || path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) return text(res, 'forbidden', 403);
-        const norm = path.posix.normalize(raw);
-        if (!/\.md$/i.test(norm) || !(norm.startsWith('docs/') || norm.startsWith('.studio/checkpoints/'))) return text(res, 'forbidden', 403);
-        const full = path.resolve(REPO, norm);
-        if (!full.startsWith(REPO + path.sep)) return text(res, 'forbidden', 403);
+        // gate links carry absolute {{home}} paths; resolveDocPath maps those inside HQ to docs/… and refuses the rest
+        const full = require('./filepath.js').resolveDocPath(url.searchParams.get('path') || '', REPO);
+        if (!full) return text(res, 'forbidden', 403);
         if (!isFile(full)) return text(res, 'not found', 404);
         return text(res, fs.readFileSync(full, 'utf8'));
       }
