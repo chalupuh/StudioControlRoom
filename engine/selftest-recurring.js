@@ -112,6 +112,27 @@ console.log('C. refresh stale stage rules on resume');
   check(run.stages[1].check === 'qa-check 1' && run.stages[1].rework.verdict === 'qa-1.md', 'expanded qa#1 keeps its per-item check and report path');
   check(n === 4, 'reports the number of rules changed');
   check(engine.refreshStages({ pipeline: 'missing', stages: [] }) === 0, 'missing pipeline file is a no-op');
+
+  // 2026-11-09 afternoon: Opus reviews hit an old 30-turn cap, a docs review had no rework loop, and an old
+  // lite-build run kept a backslash home path that broke its qa#1 check (ENOENT).
+  fs.writeFileSync(path.join(pipes, 'q.json'), JSON.stringify({ stages: [
+    { type: 'foreach', id: 'items', stages: [
+      { id: 'qa', type: 'agent', maxTurns: 40, check: "read('{{home}}/qa-m{{n}}.md')" },
+      { id: 'other', type: 'agent', check: 'x {{g2}}' } ] },
+    { id: 'review', type: 'agent', maxTurns: 60, timeoutMin: 45, rework: { to: 'build', verdict: 'rv-{{sprint}}.md', failRegex: 'REQUEST CHANGES', max: 3 } },
+  ] }));
+  const bs = String.fromCharCode(92);
+  const r2 = { pipeline: 'q', vars: { home: 'C:' + bs + 'HQ' + bs + 'x', sprint: '4j' }, stages: [
+    { id: 'qa#2', maxTurns: 25, check: "read('C:" + bs + 'HQ' + bs + "x/qa-m2.md')" },
+    { id: 'other#2', check: 'x item-two' },
+    { id: 'review', maxTurns: 30 } ] };
+  engine.refreshStages(r2);
+  check(r2.vars.home === 'C:/HQ/x', 'backslash home var normalised to forward slashes');
+  check(r2.stages[0].check === "read('C:/HQ/x/qa-m2.md')", 'expanded check re-filled with the run vars and item number');
+  check(r2.stages[1].check === 'x item-two', 'expanded check needing per-item values is left alone');
+  check(r2.stages[0].maxTurns === 40 && r2.stages[2].maxTurns === 60 && r2.stages[2].timeoutMin === 45, 'turn and time limits refreshed');
+  check(r2.stages[2].rework && r2.stages[2].rework.failRegex === 'REQUEST CHANGES', 'a newly added rework loop reaches the run');
+  if (engine.fill) check(engine.fill('{{title}}', { title: 'feat: sprint {{sprint}}', sprint: '4i' }) === 'feat: sprint 4i', 'a var naming another var is filled');
 }
 
 console.log('D. headless permissions and rules');
