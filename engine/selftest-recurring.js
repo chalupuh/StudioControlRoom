@@ -23,6 +23,11 @@ console.log('A. usage limits');
   check(engine.isUsageLimit('Claude AI usage limit reached|1794214800'), '"usage limit reached" detected');
   check(!engine.isUsageLimit('VERDICT: PASS. The rate limiter in studio.js handles 429 correctly.\n' + 'x'.repeat(700)), 'a long report about rate limits is not a limit');
   check(!engine.isUsageLimit(''), 'empty text is not a limit');
+  for (const t of ['5-hour limit reached ∙ resets 3pm', 'Session limit reached ∙ resets 4am', 'Opus weekly limit reached ∙ resets Oct 9, 10am', 'API Error: 429 rate_limit_error'])
+    check(engine.isUsageLimit(t), 'detected: ' + t);
+  const fp = 'Done. Added a rate limit to POST /login; returns 429 Too Many Requests when exceeded. Tests pass, committed.';
+  check(!engine.isUsageLimit(fp), 'a short build report about adding a 429 rate limit is not a usage limit');
+  check(engine.parseRunOutput({ stdout: JSON.stringify({ result: "You've hit your 5-hour limit" }), stderr: '', status: 0 }).usageLimit === false, 'a successful run is never flagged as a usage limit');
 
   const sleeps = []; engine.hooks.sleep = (ms) => sleeps.push(ms);
   let calls = 0;
@@ -62,6 +67,12 @@ console.log('B. misplaced reports');
   const old = new Date(Date.now() - 3600e3); fs.utimesSync(path.join(wt, rel), old, old);
   const moved = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: [rel] }, { workdir: sl(wt) }, Date.now());
   check(moved.length === 0 && !fs.existsSync(path.join(HOME, rel)), 'stale worktree copy is left alone');
+  // a stale HQ copy from an earlier round is moved aside and the fresh worktree report wins
+  fs.writeFileSync(path.join(HOME, rel), 'old HQ copy'); fs.utimesSync(path.join(HOME, rel), old, old);
+  fs.writeFileSync(path.join(wt, rel), 'fresh\nREQUEST CHANGES\n');
+  const m2 = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: [rel] }, { workdir: sl(wt) }, Date.now() - 1000);
+  check(m2.length === 1 && /fresh/.test(fs.readFileSync(path.join(HOME, rel), 'utf8')), 'fresh report replaces a stale HQ copy');
+  check(fs.existsSync(path.join(HOME, rel.replace(/\.md$/, '-stale.md'))), 'stale HQ copy kept as -stale.md');
   // never escapes HQ
   const esc = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: ['../outside.md'] }, { workdir: sl(wt) }, 0);
   check(esc.length === 0, 'paths outside HQ are ignored');
@@ -76,24 +87,32 @@ console.log('C. refresh stale stage rules on resume');
       { id: 'qa', type: 'agent', check: 'qa-check {{n}}', rework: { to: 'build', verdict: 'qa-{{n}}.md', failRegex: 'VERDICT:[\\s*_`]*FAIL', max: 3 } } ] },
     { id: 'review', type: 'agent', check: 'NEW-CHECK', rework: { to: 'build', verdict: 'r.md', failRegex: 'REQUEST CHANGES[\\s*_`]*$', max: 3 } },
   ] }));
-  const run = { pipeline: 'p', stages: [
+  const run = { pipeline: 'p', stages: [ { id: 'items', type: 'foreach', stages: [{ id: 'build', type: 'agent' }] },
     { id: 'build#1' }, { id: 'qa#1', check: 'qa-check 1', rework: { to: 'build', verdict: 'qa-1.md', failRegex: 'VERDICT: FAIL', max: 3 } },
     { id: 'review', check: 'OLD-CHECK', rework: { to: 'build', verdict: 'r.md', failRegex: 'REQUEST CHANGES\\s*$', max: 3 } } ] };
   const n = engine.refreshStages(run);
+  check(run.stages[0].stages.length === 2 && run.stages[0].stages[1].rework.failRegex === 'VERDICT:[\\s*_`]*FAIL', 'unexpanded foreach takes the template inner stages');
+  run.stages.shift();
   check(run.stages[2].rework.failRegex === 'REQUEST CHANGES[\\s*_`]*$', 'review failRegex refreshed');
   check(run.stages[2].check === 'NEW-CHECK', 'unsuffixed review check refreshed');
   check(run.stages[1].rework.failRegex === 'VERDICT:[\\s*_`]*FAIL', 'expanded qa#1 failRegex refreshed');
   check(run.stages[1].check === 'qa-check 1' && run.stages[1].rework.verdict === 'qa-1.md', 'expanded qa#1 keeps its per-item check and report path');
-  check(n === 3, 'reports the number of rules changed');
+  check(n === 4, 'reports the number of rules changed');
   check(engine.refreshStages({ pipeline: 'missing', stages: [] }) === 0, 'missing pipeline file is a no-op');
 }
 
 console.log('D. headless permissions and rules');
 {
-  const t = engine.allowedToolsFor({ allowedTools: ['Bash(cargo:*)'] });
-  for (const need of ['Bash(git commit:*)', 'Bash(git add:*)', 'Bash(npm:*)', 'Bash(node:*)', 'Bash(powershell:*)', 'Bash(cargo:*)']) check(t.includes(need), `allowed: ${need}`);
-  for (const no of ['Bash(git push:*)', 'Bash(gh:*)', 'Bash(git reset --hard:*)']) check(engine.DISALLOWED_TOOLS.includes(no) && !t.includes(no), `denied: ${no}`);
-  check(/never ask/i.test(engine.UNATTENDED_RULES) && /never push/i.test(engine.UNATTENDED_RULES), 'prompt tells agents they run unattended and must not push');
+  const lane = 'C:/lanes/x';
+  const b = engine.allowedToolsFor({ id: 'build#1', allowedTools: ['Bash(cargo:*)'] }, lane);
+  for (const need of ['Bash(git commit:*)', 'Bash(git add:*)', 'Bash(git restore:*)', 'Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npm install:*)', 'Bash(node:*)', 'Bash(npx tsc:*)', 'Bash(powershell -NoProfile -ExecutionPolicy Bypass -File:*)', 'Bash(cargo:*)']) check(b.includes(need), 'build in a lane may: ' + need);
+  for (const no of ['Bash(powershell:*)', 'Bash(pwsh:*)', 'Bash(npx:*)', 'Bash(find:*)', 'Bash(npm:*)']) check(!b.includes(no), 'not granted (runs arbitrary inline code): ' + no);
+  for (const no of ['Bash(git push:*)', 'Bash(gh:*)', 'Bash(git reset --hard:*)', 'Bash(git -C:*)']) check(engine.DISALLOWED_TOOLS.includes(no) && !b.includes(no), 'denied: ' + no);
+  const qa = engine.allowedToolsFor({ id: 'qa#1' }, lane), hq = engine.allowedToolsFor({ id: 'build#1' }, engine.REPO);
+  check(!qa.includes('Bash(git commit:*)') && !hq.includes('Bash(git commit:*)'), 'QA stages and stages in the HQ checkout get no commit tools');
+  const rb = engine.unattendedRules({ id: 'build#1' }, lane), rq = engine.unattendedRules({ id: 'review' }, lane), rh = engine.unattendedRules({ id: 'build#1' }, engine.REPO);
+  check(/never ask/i.test(rb) && /never push/i.test(rb) && /git commit/.test(rb), 'lane build: unattended, commit, never push');
+  check(/do NOT commit/.test(rq) && /do NOT commit/.test(rh), 'review and HQ stages are told not to commit');
 }
 
 console.log('E. failure reason text');

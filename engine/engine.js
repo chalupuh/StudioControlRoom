@@ -109,10 +109,12 @@ const isCliErrorResult = (result) => {
 };
 // A plan usage/rate limit ("You've hit your 5-hour limit · resets 4am") is not a failure of the stage: the
 // engine waits for the reset and retries the same tier (2026-11-09: every run blocked at ~2 AM on this).
-// Only short, error-sized texts count, so a report that merely discusses limits is not misread.
+// Only short, error-sized texts count, and parseRunOutput only asks when the run itself failed, so a finished
+// report that mentions rate limiting ("added a 429 rate limit to /login") is never misread.
+const USAGE_LIMIT_RX = /hit your .{0,30}limit|\b(5-hour|session|weekly|opus|sonnet|usage)\s+limit\s+(reached|exceeded)|limit reached.{0,10}resets|^API Error:.{0,80}\b(rate[_ ]limit|429)\b/i;
 const isUsageLimit = (text) => {
   const t = String(text || '').trim();
-  return t.length > 0 && t.length < 600 && /hit your .{0,30}limit|usage limit (reached|exceeded)|rate[_ ]limit(ed|_error)?\b.{0,40}(reached|exceeded|try again)|\b429\b.{0,40}too many requests/i.test(t);
+  return t.length > 0 && t.length < 600 && USAGE_LIMIT_RX.test(t);
 };
 function parseRunOutput(r) {
   let out = {};
@@ -120,11 +122,13 @@ function parseRunOutput(r) {
   const rawStderr = (r.stderr || '');
   const modelWarning = rawStderr.includes('[claude-code:unrecognized_model]');
   // Known harmless warnings must not be reported as the failure reason (they hid the real cause overnight).
-  const stderr = rawStderr.split(/\r?\n/).filter((l) => !/^\s*⚠ claude\.ai connectors are disabled|\[claude-code:unrecognized_model\]|^Ignoring \d+ permissions\.allow entries/.test(l)).join('\n').trim();
+  const stderr = rawStderr.split(/\r?\n/).filter((l) => !/^\s*(?:⚠ claude\.ai connectors are disabled|.*\[claude-code:unrecognized_model\]|Ignoring \d+ permissions\.allow entries)/.test(l)).join('\n').trim();
   const hasFailure = out.is_error || r.status !== 0 || !!r.error || !!r.signal;
   const hasResult = !!out.result;
+  const usageLimit = !!hasFailure && (isUsageLimit(out.result) || isUsageLimit(rawStderr.slice(-2000)));
   // A CLI/API error printed as the "result" (e.g. "API Error: ... exceeded the 32000 output token maximum")
   // is not an answer: report it as an error so the attempt fails and climbs the tier ladder.
+  // (is_error with a real result stays a partial success by design; see selftest.js.)
   const cliError = isCliErrorResult(out.result);
   return {
     turns: out.num_turns,
@@ -132,7 +136,7 @@ function parseRunOutput(r) {
     error: cliError ? String(out.result).trim().slice(0, 800)
       : (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
     ignoredWarning: modelWarning ? rawStderr.slice(0, 300) : null,
-    usageLimit: isUsageLimit(out.result) || isUsageLimit(rawStderr.slice(-2000)),
+    usageLimit,
     usage: out.usage ? { in: out.usage.input_tokens, out: out.usage.output_tokens, cached: out.usage.cache_read_input_tokens } : null,
     hitTurnCap: out.subtype === 'error_max_turns',
   };
@@ -158,19 +162,34 @@ function localTierEnv(tier, machineCfg = {}) {
 
 // Every stage runs headless: nobody can answer a question or approve a prompt (2026-11-09: local runs asked
 // "what would you like me to work on?", builders stopped to ask "want me to commit?").
-const UNATTENDED_RULES = 'You are running unattended in a pipeline: nobody will read questions or approve prompts until you finish. ' +
-  'Never ask what to do, never ask for confirmation and never wait for approval. Do the task now, commit your changes to the current branch ' +
-  '(git add + git commit; never push), write every required file, then end with a short report. If a command is refused, keep going ' +
-  'with what you can do and say in the report exactly which command could not run.';
+// Only build stages working in their own checkout (a lane worktree or app repo) commit. Stages that run in the
+// HQ checkout (R&D, research) or that only check work (QA, review) never commit: HQ sits on main with unrelated
+// runtime files, and git there goes through branch → PR → squash merge (ADR 0002).
+const commitsWork = (stage, cwd) => mustChange(stage) && cwd !== REPO;
+function unattendedRules(stage, cwd) {
+  const git = commitsWork(stage, cwd)
+    ? 'commit your changes to the current branch (git add <files> + git commit; never push, never switch branches)'
+    : 'do NOT commit or change git state; the engine and the owner handle git for this stage';
+  return 'You are running unattended in a pipeline: nobody will read questions or approve prompts until you finish. ' +
+    `Never ask what to do, never ask for confirmation and never wait for approval. Do the task now, ${git}, write every required file, ` +
+    'then end with a short report. If a command is refused, keep going with what you can do and say in the report exactly which command could not run.';
+}
+// Auto-approved for headless stages. Note: DISALLOWED_TOOLS only guards direct invocations; anything that can run
+// arbitrary code (node -e, npm scripts) could still reach git. That is accepted for node/npm, which every build
+// and QA stage needs; shells that take inline commands (powershell -c, pwsh, npx <any package>, find -exec) are
+// not granted: PowerShell is limited to running script files, npx to the project's own dev tools.
 const BASE_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)',
-  'Bash(git mv:*)', 'Bash(git rm:*)', 'Bash(git branch --show-current:*)', 'Bash(git rev-parse:*)', 'Bash(git ls-files:*)',
-  'Bash(npm:*)', 'Bash(npx:*)', 'Bash(node:*)', 'Bash(powershell:*)', 'Bash(pwsh:*)',
-  'Bash(ls:*)', 'Bash(cat:*)', 'Bash(head:*)', 'Bash(tail:*)', 'Bash(wc:*)', 'Bash(grep:*)', 'Bash(find:*)', 'Bash(mkdir:*)',
+  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git rev-parse:*)', 'Bash(git ls-files:*)',
+  'Bash(git branch --show-current:*)',
+  'Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npm install:*)', 'Bash(npm ci:*)', 'Bash(npm ls:*)', 'Bash(node:*)',
+  'Bash(npx tsc:*)', 'Bash(npx jest:*)', 'Bash(npx vitest:*)', 'Bash(npx eslint:*)', 'Bash(npx prettier:*)', 'Bash(npx expo:*)',
+  'Bash(powershell -NoProfile -ExecutionPolicy Bypass -File:*)', 'Bash(powershell -ExecutionPolicy Bypass -File:*)', 'Bash(powershell -File:*)',
+  'Bash(ls:*)', 'Bash(cat:*)', 'Bash(head:*)', 'Bash(tail:*)', 'Bash(wc:*)', 'Bash(grep:*)', 'Bash(rg:*)', 'Bash(mkdir:*)', 'Bash(touch:*)',
   'Bash(cp:*)', 'Bash(mv:*)', 'Bash(cd:*)', 'Bash(pwd:*)', 'Bash(echo:*)', 'Bash(diff:*)', 'Bash(sort:*)'];
+const COMMIT_TOOLS = ['Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git mv:*)', 'Bash(git rm:*)', 'Bash(git restore:*)', 'Bash(git stash:*)'];
 const DISALLOWED_TOOLS = ['Bash(git push:*)', 'Bash(git reset --hard:*)', 'Bash(git clean:*)', 'Bash(git checkout:*)',
-  'Bash(git switch:*)', 'Bash(git rebase:*)', 'Bash(gh:*)', 'Bash(npm publish:*)', 'Bash(rm -rf:*)'];
-const allowedToolsFor = (stage) => [...new Set([...BASE_ALLOWED_TOOLS, ...(stage.allowedTools || [])])];
+  'Bash(git switch:*)', 'Bash(git rebase:*)', 'Bash(git -C:*)', 'Bash(gh:*)', 'Bash(npm publish:*)', 'Bash(rm -rf:*)', 'Bash(rm -fr:*)'];
+const allowedToolsFor = (stage, cwd) => [...new Set([...BASE_ALLOWED_TOOLS, ...(commitsWork(stage, cwd) ? COMMIT_TOOLS : []), ...(stage.allowedTools || [])])];
 
 // ---- run one agent stage on a given tier ----
 function runAgent(stage, tierName, vars, feedback, reworkNote) {
@@ -190,7 +209,7 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
   const cwd = workdir(vars);
   const logCmd = cwd === REPO ? 'node .studio/studio.js' : `node "${STUDIO}"`;
   prompt += `\n\nStudio rules: work only inside this repository (${cwd}). Org docs, specs and backlogs live in ${REPO} (read-only unless the task says to write there). Report progress with \`${logCmd} log ${stage.agent} <pct> "<msg>"\`.`;
-  prompt += `\n${UNATTENDED_RULES}`;
+  prompt += `\n${unattendedRules(stage, cwd)}`;
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files at exactly these absolute paths (not inside ${cwd} unless the path says so): ${stage.expect.map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}.`;
   if (reworkNote) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
@@ -207,7 +226,7 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
   // Headless runs can't answer permission prompts, and lane worktrees are "untrusted" folders whose project
   // settings Claude Code ignores, so the tools a stage needs (tests, builds, local commits) are granted on the
   // command line. Pushing, merging and destructive git stay with the ship script and the owner.
-  args.push('--allowedTools', ...allowedToolsFor(stage), '--disallowedTools', ...DISALLOWED_TOOLS);
+  args.push('--allowedTools', ...allowedToolsFor(stage, cwd), '--disallowedTools', ...DISALLOWED_TOOLS);
   const t0 = Date.now();
   const r = spawnSync(claudeExe(), args, { cwd: workdir(vars), env, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 });
   const parsed = parseRunOutput(r);
@@ -346,28 +365,37 @@ function handleRework(run, stage, vars, res, t0) {
 // ---- usage-limit waits ----
 const LIMIT_WAIT_MS = Number(process.env.STUDIO_LIMIT_WAIT_MS) || 15 * 60000;
 const LIMIT_MAX_WAITS = Number(process.env.STUDIO_LIMIT_MAX_WAITS) || 48; // 12 h, then the owner decides
-function sleepMs(ms) { // synchronous like the rest of the engine; wakes early if the studio is paused
+function sleepMs(ms, agentId) { // synchronous like the rest of the engine; wakes early if the studio or the agent's team pauses
   const cell = new Int32Array(new SharedArrayBuffer(4));
-  for (let left = ms; left > 0 && !paused(); left -= 60000) Atomics.wait(cell, 0, 0, Math.min(60000, left));
+  for (let left = ms; left > 0 && !paused(agentId); left -= 60000) Atomics.wait(cell, 0, 0, Math.min(60000, left));
 }
 
 // ---- reports written in the wrong place ----
 // Agents working in a lane worktree sometimes write an HQ report (docs/internal/review-*.md, QA reports) at
 // the same relative path inside the worktree. The check then sees it as missing and the stage climbs or blocks
-// (2026-11-08/09: lane D and J reviews). Move a fresh misplaced copy to the HQ path the stage expects.
+// (2026-11-08/09: lane D and J reviews). Bring a fresh misplaced copy to the HQ path the stage expects.
+// A stale HQ file from an earlier round is moved aside (-stale.md) so it can't pass the check in place of the
+// fresh report. A file the lane has committed is copied, not moved, so the lane tree is left clean.
+const isTracked = (dir, rel) => spawnSync('git', ['ls-files', '--error-unmatch', '--', rel], { cwd: dir, stdio: 'ignore' }).status === 0;
 function adoptMisplacedReports(run, stage, vars, t0) {
   const wd = workdir(vars);
   if (wd === REPO) return [];
   const targets = [...(stage.expect || []), ...(stage.rework && stage.rework.verdict ? [stage.rework.verdict] : [])];
+  const fresh = (p) => { try { return fs.statSync(p).mtimeMs >= t0 - 2000; } catch { return false; } };
   const moved = [];
   for (const e of new Set(targets.map((x) => fill(x, vars)))) {
     const dest = path.resolve(REPO, e);
     const rel = path.relative(REPO, dest);
-    if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || fs.existsSync(dest)) continue;
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
     const src = path.join(wd, rel);
-    try { if (!fs.existsSync(src) || fs.statSync(src).mtimeMs < t0 - 2000) continue; } catch { continue; }
+    try { if (!fs.existsSync(src) || fs.lstatSync(src).isSymbolicLink() || !fresh(src)) continue; } catch { continue; }
+    if (fs.existsSync(dest)) {
+      if (fresh(dest)) continue; // the agent wrote the HQ copy too: that one wins
+      fs.renameSync(dest, dest.replace(/(\.[^./\\]+)?$/, (x) => `-stale${x || ''}`));
+    }
     fs.mkdirSync(path.dirname(dest), { recursive: true });
-    try { fs.renameSync(src, dest); } catch { fs.copyFileSync(src, dest); try { fs.unlinkSync(src); } catch {} }
+    if (isTracked(wd, rel)) fs.copyFileSync(src, dest);
+    else { try { fs.renameSync(src, dest); } catch { fs.copyFileSync(src, dest); try { fs.unlinkSync(src); } catch {} } }
     moved.push(toSlash(rel));
   }
   if (moved.length) {
@@ -390,6 +418,8 @@ function refreshStages(run) {
   for (const s of run.stages || []) {
     const t = tpl[String(s.id || '').replace(/#\d+$/, '')];
     if (!t) continue;
+    // a foreach not expanded yet has no per-item values: take its inner stages from the template wholesale
+    if (s.type === 'foreach' && t.type === 'foreach') { if (JSON.stringify(s.stages) !== JSON.stringify(t.stages)) { s.stages = JSON.parse(JSON.stringify(t.stages)); changed++; } continue; }
     if (s.rework && t.rework) for (const k of ['failRegex', 'max']) if (t.rework[k] !== undefined && s.rework[k] !== t.rework[k]) { s.rework[k] = t.rework[k]; changed++; }
     if (!/#\d+$/.test(s.id) && t.check && s.check !== t.check) { s.check = t.check; changed++; }
   }
@@ -408,7 +438,7 @@ function writePostmortem(run, stage) {
   const fname = `${run.id}-${stage.id}.md`;
   const filePath = path.resolve(REPO, 'docs', 'postmortems', fname);
   fs.mkdirSync(dir, { recursive: true });
-  const stageHistory = (run.history || []).filter((h) => h.stage === stage.id);
+  const stageHistory = (run.history || []).filter((h) => h.stage === stage.id && !['usage-limit', 'adopted-report', 'manager-reset'].includes(h.type));
   const tiersTried = [...new Set(stageHistory.map((h) => h.tier).filter(Boolean))];
   let lines = [
     `# Postmortem: ${run.id} → ${stage.id}`,
@@ -524,16 +554,20 @@ function advance(run) {
         run.limitWaits = (run.limitWaits || 0) + 1;
         run.history.push({ stage: stage.id, type: 'usage-limit', tier: tierName, wait: run.limitWaits, at: now(), note: String(res.result || res.error || '').slice(0, 200) });
         if (run.limitWaits > LIMIT_MAX_WAITS) {
-          run.status = 'blocked'; run.blockedReason = `${tierName} usage limit did not reset after ${LIMIT_MAX_WAITS} waits`; save(run);
+          run.status = 'blocked'; run.blockedReason = `${tierName} usage limit did not reset after ${LIMIT_MAX_WAITS} waits`;
+          run.limitWaits = 0; delete run.limitUntil; save(run); // a later resume gets a full set of waits again
           ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. ${run.blockedReason}.` });
           console.log(`\n⛔ BLOCKED at ${stage.id}: ${run.blockedReason}`);
           return;
         }
-        run.status = 'waiting-limit'; save(run);
+        // Status stays 'running' (every Control Room view already knows it); limitUntil says why it is idle.
+        // If the engine dies mid-wait, `resume` picks the run up like any other interrupted run.
+        run.limitUntil = new Date(Date.now() + LIMIT_WAIT_MS).toISOString(); save(run);
         ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'waiting', message: `${stage.id}: ${tierName} usage limit hit; waiting ${Math.round(LIMIT_WAIT_MS / 60000)} min, then retrying` });
         console.log(`  ⏸ ${tierName} usage limit hit; waiting ${Math.round(LIMIT_WAIT_MS / 60000)} min (wait ${run.limitWaits}/${LIMIT_MAX_WAITS})`);
-        hooks.sleep(LIMIT_WAIT_MS);
-        run.status = 'running'; save(run);
+        hooks.sleep(LIMIT_WAIT_MS, stage.agent);
+        delete run.limitUntil; save(run);
+        if (paused(stage.agent)) break; // the owner paused during the wait: the normal paused path below saves the run
         attempt--; continue; // same tier again; a usage limit is not a failed attempt
       }
       run.limitWaits = 0;
@@ -589,11 +623,11 @@ if (require.main === module) {
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
 		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
 	} else if (cmd === 'resume') {
-		const run = load(rest[0]); run.status = 'running';
+		const run = load(rest[0]); run.status = 'running'; run.limitWaits = 0; delete run.limitUntil;
 		const n = refreshStages(run); if (n) console.log(`Refreshed ${n} stage rule(s) from the current ${run.pipeline} pipeline.`);
 		save(run); advance(run);
 	} else if (cmd === 'approve') {
-		const run = load(rest[0]); const decision = rest[1] || 'approve';
+		const run = load(rest[0]); const decision = rest[1] || 'approve'; refreshStages(run);
 		const gid = Object.keys(run.gates).find((k) => run.gates[k].status === 'waiting');
 		if (!gid) { console.log('No gate is waiting.'); process.exit(0); }
 		Object.assign(run.gates[gid], { status: decision === 'reject' ? 'rejected' : 'approved', note: rest[2] || '', decided: now() });
@@ -607,4 +641,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, UNATTENDED_RULES, parseRunOutput, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
