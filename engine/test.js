@@ -14,6 +14,7 @@ const SUITES = [
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
+  { file: 'selftest-filepath.js',     label: '/api/file path resolution (gate links)' },
 ];
 
 let anyFailed = false;
