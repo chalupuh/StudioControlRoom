@@ -101,6 +101,12 @@ const load = (id) => JSON.parse(fs.readFileSync(runFile(id), 'utf8'));
 // A partial success (hasFailure but hasResult) does NOT report an error.
 // The [claude-code:unrecognized_model] stderr warning is logged to ignoredWarning for
 // observability but NEVER suppresses an error — real failures must still be reported.
+const isCliErrorResult = (result) => {
+  const t = String(result || '').trim();
+  // The token-limit phrase only counts in a short, error-sized result, so a long real report that merely
+  // mentions it (e.g. a review of this very check) is not misread as a failure.
+  return /^API Error:/i.test(t) || (t.length < 500 && /exceeded the \d+ output token maximum/i.test(t));
+};
 function parseRunOutput(r) {
   let out = {};
   try { out = JSON.parse((r.stdout || '').trim().split('\n').filter(Boolean).pop() || '{}'); } catch {}
@@ -108,10 +114,14 @@ function parseRunOutput(r) {
   const modelWarning = stderr.includes('[claude-code:unrecognized_model]');
   const hasFailure = out.is_error || r.status !== 0 || !!r.error || !!r.signal;
   const hasResult = !!out.result;
+  // A CLI/API error printed as the "result" (e.g. "API Error: ... exceeded the 32000 output token maximum")
+  // is not an answer: report it as an error so the attempt fails and climbs the tier ladder.
+  const cliError = isCliErrorResult(out.result);
   return {
     turns: out.num_turns,
     result: String(out.result || '').slice(0, 2000),
-    error: (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
+    error: cliError ? String(out.result).trim().slice(0, 800)
+      : (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
     ignoredWarning: modelWarning ? stderr.slice(0, 300) : null,
     usage: out.usage ? { in: out.usage.input_tokens, out: out.usage.output_tokens, cached: out.usage.cache_read_input_tokens } : null,
     hitTurnCap: out.subtype === 'error_max_turns',
@@ -245,18 +255,30 @@ function resolveTeamLead(designPath) {
 // Returns 'none' (no valid FAIL verdict: normal verify/tier logic applies), 'back' (cursor moved to the build
 // stage) or 'blocked'. Only a stage that ran cleanly and wrote a fresh report containing a FAIL verdict counts;
 // missing report, run error, turn cap or empty answer stay genuine failures that climb the tier ladder.
+// Default QA verdict: tolerant of markdown around the verdict ("**VERDICT:** FAIL", "VERDICT: `FAIL`").
+const DEFAULT_FAIL_REGEX = 'VERDICT:[\\s*_`]*FAIL';
+// Rework target: the LAST stage before the cursor named `to` (or `to#N`). A suffixed stage (qa#2) goes to its
+// own item (build#2). An unsuffixed stage (a sprint-wide review after a foreach) goes to the most recent build,
+// not build#1. Returns -1 when there is none.
+function reworkTarget(stages, cur, to, suffix) {
+  for (let i = Math.min(cur, stages.length) - 1; i >= 0; i--) {
+    const id = stages[i].id || '';
+    if (suffix ? id === to + suffix : (id === to || id.startsWith(to + '#'))) return i;
+  }
+  return -1;
+}
 function handleRework(run, stage, vars, res, t0) {
   const rw = stage.rework;
   if (!rw || res.error || res.hitTurnCap || !String(res.result || '').trim()) return 'none';
   const rp = path.resolve(REPO, fill(rw.verdict, vars));
   let txt; try { if (fs.statSync(rp).mtimeMs < t0 - 2000) return 'none'; txt = fs.readFileSync(rp, 'utf8'); } catch { return 'none'; }
-  if (!new RegExp(rw.failRegex || 'VERDICT:\\s*FAIL').test(txt)) return 'none';
+  if (!new RegExp(rw.failRegex || DEFAULT_FAIL_REGEX).test(txt)) return 'none';
   const max = rw.max || 3;
   run.reworks = run.reworks || {};
   const n = run.reworks[stage.id] = (run.reworks[stage.id] || 0) + 1;
   const suffix = (stage.id.match(/#\d+$/) || [''])[0];
   const cur = run.cursor;
-  const target = run.stages.findIndex((s, i) => i < cur && (suffix ? s.id === rw.to + suffix : (s.id === rw.to || s.id.startsWith(rw.to + '#'))));
+  const target = reworkTarget(run.stages, cur, rw.to, suffix);
   // keep history: <name>.md -> <name>-round<N>.md (also forces the next QA/review to write a fresh report)
   const kept = rp.replace(/(\.[^./\\]+)?$/, (e) => `-round${n}${e || ''}`);
   try { fs.renameSync(rp, kept); } catch {}
@@ -468,4 +490,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { advance, hooks, parseRunOutput, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { advance, hooks, parseRunOutput, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
