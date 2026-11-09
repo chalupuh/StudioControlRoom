@@ -59,11 +59,17 @@ function Register-Task {
         -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
         -AllowHardTerminate
 
-    # Use the .cmd wrapper to set STUDIO_HOME as an env var before launching node.
+    # Register supervise.cmd directly as the action executable.
+    # STUDIO_HOME and STUDIO_NODE are injected as task environment variables so the
+    # wrapper does not need arguments (avoids nested quoting with spaces in paths) and
+    # node is pinned to the exact executable the installer resolved.
     $action  = New-ScheduledTaskAction `
-        -Execute 'cmd.exe' `
-        -Argument "/c `"$wrapper`" `"$StudioHome`" `"$node`"" `
-        -WorkingDirectory $repo
+        -Execute $wrapper `
+        -WorkingDirectory $repo `
+        -EnvironmentVariable @{
+            'STUDIO_HOME' = $StudioHome;
+            'STUDIO_NODE' = $node;
+        }
 
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     # Run as the current user via S4U (no password stored, works whether logged on or not).

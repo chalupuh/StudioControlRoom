@@ -111,7 +111,9 @@ function supervise(ctx) {
   return setInterval(pass, INTERVAL_MS);
 }
 
-/** Run daily backup at 03:00 local time if none was done yet today. */
+/** Run daily backup at 03:00 local time if none was done yet today.
+ *  Retry guard: writes `.studio/backups/.last-attempt` (the local date) before
+ *  calling backup(), so a failure is not retried every 60 s. */
 function dailyBackup(ctx, log, opts = {}) {
   const now = opts.now || new Date;
   const { localDate: localDateFn } = opts;
@@ -124,10 +126,19 @@ function dailyBackup(ctx, log, opts = {}) {
   const hour = now.getHours();
   if (hour < 3) return; // first run happens before 03:00 → wait; allows catch-up after downtime
 
-  log('daily backup at 03:00 (local date ' + today + ')');
+  // S1: retry guard — don't hammer if backup failed last tick
+  const attemptFile = path.join(backupDir, '.last-attempt');
+  try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
   try {
+    const last = fs.readFileSync(attemptFile, 'utf8');
+    if (last === today) return; // already attempted today (failed or still running)
+  } catch {}
+
+  log('daily backup at ' + String(hour).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ' (local date ' + today + ')');
+  try {
+    fs.writeFileSync(attemptFile, today); // mark attempted so next tick skips
     const { backup } = require('./backup');
-    const dest = backup({ HOME: ctx.HOME });
+    const dest = backup({ HOME: ctx.HOME, now });
     if (dest) log('backup done: ' + dest);
     else log('backup: nothing to back up');
   } catch (e) {
