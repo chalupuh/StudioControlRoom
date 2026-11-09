@@ -60,37 +60,44 @@ for (let i = 0; i < 40; i++) log('line ' + i + ' ' + 'x'.repeat(30));
 const lf = fs.readdirSync(path.join(DIR, 'logs')).sort();
 check('log rotates and keeps at most 2 old files', lf.join() === 'supervisor.log,supervisor.log.1,supervisor.log.2');
 
-// dailyBackup exported and callable (actual invocation requires hour==3
-// which we can't mock; covered by integration testing in production).
-check('dailyBackup function exported', typeof sup.dailyBackup === 'function');
-
-// dailyBackup: injected now and file-existence dedup
+// dailyBackup: injected now, backup fn, hourly retry guard
 {
   const bkDir = path.join(DIR, 'backups');
   fs.mkdirSync(bkDir, { recursive: true });
-  // Create runs dir so backup has something to zip (even on non-Windows it's a no-op here).
   const logs = [];
   const mockCtx = { HOME: HOME, DIR: DIR };
 
+  let backupCallCount = 0;
+  const mockBackup = () => { backupCallCount++; return Promise.resolve(null); };
+  const mockLocalDate = (d) => sup.dailyBackup.toString().includes('localDate') ? require('../studio/backup').localDate(d) : '2026-01-01';
+
   // before 03:00 → no backup
   const before03 = new Date(2026, 0, 1, 2, 59);
-  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: before03 });
-  check('dailyBackup: 02:59 does not run', logs.length === 0);
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: before03, backup: mockBackup, localDate: mockLocalDate });
+  check('dailyBackup: 02:59 does not run', logs.length === 0 && backupCallCount === 0);
 
-  // 03:00 → would run (but backup() might fail in test env; just check it was attempted).
+  // 03:00 → backup triggered
   const at03 = new Date(2026, 0, 1, 3, 0);
-  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: at03 });
-  // We got at least one log line meaning the path was entered.
-  check('dailyBackup: 03:00 triggers backup path', logs.some((m) => /daily backup/.test(m)));
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: at03, backup: mockBackup, localDate: mockLocalDate });
+  check('dailyBackup: 03:00 triggers backup', logs.some((m) => /daily backup/.test(m)) && backupCallCount === 1);
   logs.length = 0;
 
-  // Same day, second call → skip (if zip was created) or at least attempt (if not).
-  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 4, 0) });
-  // If a zip exists for 2026-01-01, we should get no new "daily backup" logs.
+  // 03:01 → within 60 min of last attempt → skipped (hourly retry guard)
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 3, 1) });
+  check('dailyBackup: 03:01 skipped (within 1 h)', !logs.some((m) => /daily backup/.test(m)) && backupCallCount === 1);
+
+  // 04:01 → more than 60 min → retry
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 4, 1), backup: mockBackup, localDate: mockLocalDate });
+  check('dailyBackup: 04:01 retried (past 1 h)', logs.some((m) => /daily backup/.test(m)) && backupCallCount === 2);
+  logs.length = 0;
+
+  // Unconditional same-day dedup: once zip exists, no further attempts that day.
+  // Simulate successful backup by creating the zip.
   const todayZip = path.join(bkDir, '2026-01-01.zip');
-  if (fs.existsSync(todayZip)) {
-    check('dailyBackup: same-day zip exists → dedup', !logs.some((m) => /daily backup/.test(m)));
-  }
+  fs.writeFileSync(todayZip, 'fake');
+  sup.dailyBackup(mockCtx, (m) => logs.push(m), { now: new Date(2026, 0, 1, 10, 0), backup: mockBackup, localDate: mockLocalDate });
+  check('dailyBackup: same-day zip exists → dedup unconditionally', !logs.some((m) => /daily backup/.test(m)) && backupCallCount === 2);
+  fs.unlinkSync(todayZip);
 }
 
 fs.rmSync(HOME, { recursive: true, force: true });

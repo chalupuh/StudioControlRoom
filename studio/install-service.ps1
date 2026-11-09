@@ -3,20 +3,24 @@
     Install / uninstall the Studio Supervisor Windows Scheduled Task.
 
 .DESCRIPTION
-    Registers "StudioSupervisor" to run `node <repo>/studio/studio.js supervise`
+    Registers "StudioSupervisor" to run `node <repo>/studio/studio.js supervise --home <HQ>`
     at system startup (run whether user is logged on or not via S4U, restart on
-    failure every 1 min up to 999 times).  STUDIO_HOME is passed through a .cmd
-    wrapper so the supervisor sees the HQ checkout path.
+    failure every 1 min up to 999 times).  STUDIO_HOME is passed via the `--home`
+    CLI argument, so the supervisor and all its children inherit the HQ checkout path.
 
     The supervisor's 60 s tick also runs a daily backup at 03:00 — no second task needed.
 
     -Uninstall    removes the task
-    -WhatIf       dry-run (prints what would happen)
+    -WhatIf       dry-run (prints what it would do, builds the real action to validate)
+
+    Requirements:
+      - Elevated PowerShell (S4U logon type plus -RunLevel Highest require admin rights).
+      - studio.home.json exists, or -StudioHome is passed, or $env:STUDIO_HOME is set.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [switch]$Uninstall,
-    # Explicit HQ checkout path; defaults to studio.home.json → StudioControlRoom root.
+    # Explicit HQ checkout path; defaults to studio.home.json → $env:STUDIO_HOME.
     [string]$StudioHome
 )
 
@@ -24,10 +28,9 @@ $ErrorActionPreference = 'Stop'
 
 $repo   = (Resolve-Path $PSScriptRoot\..).Path
 $script = Join-Path $PSScriptRoot 'studio.js'
-$wrapper = Join-Path $PSScriptRoot 'supervise.cmd'
 $task   = 'StudioSupervisor'
 
-# Resolve STUDIO_HOME: explicit param → studio.home.json → fallback to repo root.
+# Resolve STUDIO_HOME: explicit param → studio.home.json → $env:STUDIO_HOME → error.
 if (-not $StudioHome) {
     try {
         $homeJson = Join-Path $repo 'studio.home.json'
@@ -59,17 +62,12 @@ function Register-Task {
         -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
         -AllowHardTerminate
 
-    # Register supervise.cmd directly as the action executable.
-    # STUDIO_HOME and STUDIO_NODE are injected as task environment variables so the
-    # wrapper does not need arguments (avoids nested quoting with spaces in paths) and
-    # node is pinned to the exact executable the installer resolved.
+    # Register node directly with --home arg. No per-action env vars needed
+    # (Task Scheduler ExecAction does not support environment variables).
     $action  = New-ScheduledTaskAction `
-        -Execute $wrapper `
-        -WorkingDirectory $repo `
-        -EnvironmentVariable @{
-            'STUDIO_HOME' = $StudioHome;
-            'STUDIO_NODE' = $node;
-        }
+        -Execute $node `
+        -Argument ('"{0}" supervise --home "{1}"' -f $script, $StudioHome) `
+        -WorkingDirectory $repo
 
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     # Run as the current user via S4U (no password stored, works whether logged on or not).
@@ -113,12 +111,17 @@ if ($Uninstall) {
     if ($PSCmdlet.ShouldProcess($task, 'Register Scheduled Task')) {
         Register-Task
     } else {
+        # Build the real action so the dry run exercises the same code path.
         $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
         if (-not $node) { $node = 'node.exe (from PATH)' }
+        $action = New-ScheduledTaskAction `
+            -Execute $node `
+            -Argument ('"{0}" supervise --home "{1}"' -f $script, $StudioHome) `
+            -WorkingDirectory $repo
         Write-Host "[WhatIf] Would register Scheduled Task '$task':"
         Write-Host "  Trigger   : At startup"
         Write-Host "  Principal : $env:USERDOMAIN\$env:USERNAME (S4U, no password)"
-        Write-Host "  Action    : $node via $wrapper (STUDIO_HOME=$StudioHome)  supervise"
+        Write-Host "  Action    : $($action.Execute) $($action.Arguments)"
         Write-Host "  Restart   : 1 min, up to 999 times"
         Write-Host "  Backup    : daily at 03:00 (inside the supervisor tick)"
     }

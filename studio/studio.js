@@ -15,8 +15,19 @@ const http = require('http');
 
 // SOFT = where this software lives (dashboard.html, app-dist). HOME = the org workspace (agents, docs,
 // runtime data in HOME/.studio). They are the same folder today; after the StudioControlRoom split they differ.
-// HOME: STUDIO_HOME env → studio.home.json next to the software → legacy (parent of this file's folder).
+// HOME: --home CLI arg → STUDIO_HOME env → studio.home.json next to the software → error (no repo-root fallback for supervise/backup).
 const SOFT = __dirname;
+
+/* Parse --home <path> from argv and set STUDIO_HOME so children inherit it.
+   This lets the boot task register node directly with `-Argument '… --home "C:\HQ"'`
+   instead of relying on per-action environment variables (which Task Scheduler does not support). */
+(function parseHomeArg() {
+  const idx = process.argv.indexOf('--home');
+  if (idx !== -1 && process.argv[idx + 1]) {
+    process.env.STUDIO_HOME = process.argv[idx + 1];
+  }
+})();
+
 function studioHome() {
   if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
   try { const c = JSON.parse(fs.readFileSync(path.join(SOFT, '..', 'studio.home.json'), 'utf8')); if (c.home) return path.resolve(c.home); } catch {}

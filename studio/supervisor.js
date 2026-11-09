@@ -105,18 +105,22 @@ function supervise(ctx) {
   log(`supervisor started (pid ${process.pid}, every ${INTERVAL_MS / 1000} s)`);
   const pass = () => {
     try { tick(c); } catch (e) { log('tick error: ' + (e.stack || e.message)); }
-    try { dailyBackup(c, log); } catch (e) { log('backup error: ' + (e.stack || e.message)); }
+    // dailyBackup is async (S1) — it logs its own success/failure inside dailyBackup().
+    try { dailyBackup(c, log); } catch (e) { log('backup scheduling error: ' + (e.stack || e.message)); }
   };
   pass();
   return setInterval(pass, INTERVAL_MS);
 }
 
 /** Run daily backup at 03:00 local time if none was done yet today.
- *  Retry guard: writes `.studio/backups/.last-attempt` (the local date) before
- *  calling backup(), so a failure is not retried every 60 s. */
+ *  Retry guard: `.studio/backups/.last-attempt` stores an ISO timestamp.
+ *  A failed attempt is not retried until 60 minutes have passed, so the 03:00
+ *  backup on a busy host can succeed at 04:00 or later without blocking the
+ *  entire day.
+ *  The backup runs asynchronously (S1) so tick() keeps its 60 s cadence. */
 function dailyBackup(ctx, log, opts = {}) {
-  const now = opts.now || new Date;
-  const { localDate: localDateFn } = opts;
+  const now = opts.now || new Date();
+  const { localDate: localDateFn, backup: backupFn } = opts;
   const localDate = localDateFn || require('./backup').localDate;
   const today = localDate(now);
   const backupDir = path.join(ctx.HOME, '.studio', 'backups');
@@ -126,24 +130,30 @@ function dailyBackup(ctx, log, opts = {}) {
   const hour = now.getHours();
   if (hour < 3) return; // first run happens before 03:00 → wait; allows catch-up after downtime
 
-  // S1: retry guard — don't hammer if backup failed last tick
+  // Hourly retry guard: store ISO timestamp, skip if less than 60 minutes old.
   const attemptFile = path.join(backupDir, '.last-attempt');
   try { fs.mkdirSync(backupDir, { recursive: true }); } catch {}
   try {
-    const last = fs.readFileSync(attemptFile, 'utf8');
-    if (last === today) return; // already attempted today (failed or still running)
+    const lastISO = fs.readFileSync(attemptFile, 'utf8').trim();
+    const lastTime = new Date(lastISO).getTime();
+    if (!Number.isNaN(lastTime) && (now.getTime() - lastTime) < 60 * 60 * 1000) {
+      return; // attempted within the last hour
+    }
   } catch {}
 
   log('daily backup at ' + String(hour).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0') + ' (local date ' + today + ')');
-  try {
-    fs.writeFileSync(attemptFile, today); // mark attempted so next tick skips
-    const { backup } = require('./backup');
-    const dest = backup({ HOME: ctx.HOME, now });
-    if (dest) log('backup done: ' + dest);
-    else log('backup: nothing to back up');
-  } catch (e) {
-    log('backup failed: ' + (e.message || e));
-  }
+
+  // Write attempt timestamp before starting so next tick skips
+  try { fs.writeFileSync(attemptFile, now.toISOString()); } catch {}
+
+  // S1: run backup asynchronously so tick() keeps its cadence.
+  const doBackup = backupFn || require('./backup').backup;
+  doBackup({ HOME: ctx.HOME, now })
+    .then((dest) => {
+      if (dest) log('backup done: ' + dest);
+      else log('backup: nothing to back up');
+    })
+    .catch((e) => { log('backup failed: ' + (e.message || e)); });
 }
 
 module.exports = { tick, supervise, makeLogger, takeLock, INTERVAL_MS, dailyBackup };
