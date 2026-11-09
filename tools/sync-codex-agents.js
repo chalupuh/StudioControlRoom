@@ -1,0 +1,175 @@
+#!/usr/bin/env node
+// sync-codex-agents: read .claude/agents/*.md and CLAUDE.md, generate .codex/agents/*.toml and AGENTS.md
+//
+//   node tools/sync-codex-agents.js                  show diff
+//   node tools/sync-codex-agents.js --write          write to .codex/agents/
+//   node tools/sync-codex-agents.js --dry-run        show what would change, don't write
+//
+// CLI behaviour:
+//   --write          create/update .toml files
+//   --dry-run        print a summary of planned changes (default)
+//   --check          exit 1 if any file would differ (CI gate)
+//   --home <path>    override HQ root (default: STUDIO_HOME → studio.home.json → __dirname/.. )
+
+const fs = require('fs');
+const path = require('path');
+
+// ---- locate HQ ----
+function resolveHome() {
+  const home = process.argv.find((a, i) => i > 0 && a === '--home');
+  if (home) {
+    const idx = process.argv.indexOf('--home');
+    return path.resolve(process.argv[idx + 1]);
+  }
+  if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
+  try {
+    const c = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'studio.home.json'), 'utf8'));
+    if (c.home) return path.resolve(c.home);
+  } catch {}
+  return path.resolve(__dirname, '..', '..');
+}
+
+// ---- read a text file as UTF-8 (strip BOM, normalise CRLF so output is stable across OSes) ----
+function readText(file) {
+  return fs.readFileSync(file, 'utf8').replace(/^﻿/, '').replace(/\r\n/g, '\n');
+}
+
+// ---- parse yaml front-matter ----
+function parseFrontMatter(txt) {
+  const m = txt.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  if (!m) throw new Error('missing --- delimiters');
+  const meta = {};
+  m[1].split(/\r?\n/).forEach((l) => {
+    const i = l.indexOf(':');
+    if (i > 0) meta[l.slice(0, i).trim()] = l.slice(i + 1).trim();
+  });
+  return { meta, body: m[2] };
+}
+
+// ---- read agents ----
+function readAgents(dir) {
+  const list = fs.readdirSync(dir).filter((f) => f.endsWith('.md'));
+  return list.map((f) => {
+    const txt = readText(path.join(dir, f));
+    const { meta, body } = parseFrontMatter(txt);
+    return { name: meta.name || f.replace(/\.md$/, ''), description: meta.description || '', body };
+  });
+}
+
+// ---- generate TOML ----
+function toTOML(agent) {
+  const lines = [
+    `name = "${agent.name}"`,
+    `description = ${JSON.stringify(agent.description)}`,
+    `developer_instructions = """`,
+    agent.body,
+    '"""',
+  ];
+  return lines.join('\n') + '\n';
+}
+
+// ---- generate AGENTS.md from CLAUDE.md ----
+// Model names (Claude Opus/Sonnet/Haiku) stay; the tool name and paths are mapped.
+function toAgentsMd(txt) {
+  return txt
+    .replace(/CLAUDE\.md/g, 'AGENTS.md')
+    .replace(/\.claude\//g, '.codex/')
+    .replace(/Claude Code/g, 'Codex')
+    .replace(/Claude(?! (?:Opus|Sonnet|Haiku)\b)/g, 'Codex');
+}
+
+// ---- main ----
+const home = resolveHome();
+const agentsDir = path.join(home, '.claude', 'agents');
+const codexDir = path.join(home, '.codex', 'agents');
+
+if (!fs.existsSync(agentsDir)) {
+  console.error(`ERROR: ${agentsDir} not found`);
+  process.exit(1);
+}
+
+const agents = readAgents(agentsDir);
+const claudeMd = path.join(home, 'CLAUDE.md');
+const agentsMd = path.join(home, 'AGENTS.md');
+const wantAgentsMd = fs.existsSync(claudeMd) ? toAgentsMd(readText(claudeMd)) : null;
+const manifest = { agents: agents.map((a) => a.name) };
+
+if (!fs.existsSync(codexDir)) {
+  fs.mkdirSync(codexDir, { recursive: true });
+}
+
+// Compute what would change
+const actions = [];
+for (const agent of agents) {
+  const target = path.join(codexDir, agent.name + '.toml');
+  const want = toTOML(agent);
+  if (fs.existsSync(target)) {
+    const have = fs.readFileSync(target, 'utf8');
+    if (have !== want) actions.push({ name: agent.name, change: 'update' });
+    else actions.push({ name: agent.name, change: 'ok' });
+  } else {
+    actions.push({ name: agent.name, change: 'add' });
+  }
+}
+
+// Check for stale files (in .codex/ but not in .claude/)
+const codexFiles = fs.readdirSync(codexDir).filter((f) => f.endsWith('.toml'));
+const known = new Set(agents.map((a) => a.name));
+for (const f of codexFiles) {
+  const base = f.replace(/\.toml$/, '');
+  if (!known.has(base)) {
+    actions.push({ name: base, change: 'stale' });
+  }
+}
+
+if (wantAgentsMd !== null) {
+  if (!fs.existsSync(agentsMd)) actions.push({ name: 'AGENTS.md', change: 'add' });
+  else actions.push({ name: 'AGENTS.md', change: readText(agentsMd) === wantAgentsMd ? 'ok' : 'update' });
+}
+
+// Summary
+console.log(`HQ root: ${home}`);
+console.log(`Agent count: ${agents.length}`);
+for (const a of actions) {
+  const icon = a.change === 'ok' ? '=' : a.change === 'add' ? '+' : a.change === 'stale' ? '!' : '~';
+  console.log(`  ${icon} ${a.name}  (${a.change})`);
+}
+
+const changed = actions.some((a) => a.change !== 'ok');
+
+if (process.argv.includes('--write')) {
+  if (!changed) {
+    console.log('Nothing to write.');
+    process.exit(0);
+  }
+  for (const agent of agents) {
+    const target = path.join(codexDir, agent.name + '.toml');
+    const want = toTOML(agent);
+    fs.writeFileSync(target, want, 'utf8');
+    console.log(`Wrote .codex/agents/${agent.name}.toml`);
+  }
+  if (wantAgentsMd !== null) {
+    fs.writeFileSync(agentsMd, wantAgentsMd, 'utf8');
+    console.log('Wrote AGENTS.md');
+  }
+  // Remove stale
+  for (const a of actions) {
+    if (a.change === 'stale') {
+      const f = path.join(codexDir, a.name + '.toml');
+      fs.rmSync(f);
+      console.log(`Removed stale ${a.name}.toml`);
+    }
+  }
+  // Write manifest
+  const mf = path.join(home, '.codex', 'manifest.json');
+  fs.writeFileSync(mf, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+  console.log(`Wrote manifest (${manifest.agents.length} agents)`);
+  process.exit(0);
+}
+
+if (process.argv.includes('--check') && changed) {
+  console.error('CHECK FAILED: generated .toml / AGENTS.md would differ from source .md / CLAUDE.md');
+  process.exit(1);
+}
+
+process.exit(0);
