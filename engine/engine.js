@@ -66,10 +66,15 @@ function claudeExe() {
   return found.pop();
 }
 
-function fill(tpl, vars) {
+function fill(tpl, vars, depth = 0) {
   return String(tpl || '')
     .replace(/\{\{file:([^}]+)\}\}/g, (_, f) => { const p = path.resolve(REPO, fill(f, vars)); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : `(missing: ${f})`; })
-    .replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] ?? `{{${k}}}`));
+    .replace(/\{\{(\w+)\}\}/g, (_, k) => {
+      const v = vars[k];
+      if (v === undefined || v === null) return `{{${k}}}`;
+      // a var whose value names other vars (title "feat: internal sprint {{sprint}}") is filled too, one level deep
+      return depth < 1 && typeof v === 'string' && /\{\{\w+\}\}/.test(v) ? fill(v, vars, depth + 1) : v;
+    });
 }
 
 // Forward slashes: these paths are substituted into JS/JSON/shell strings in pipeline commands, where
@@ -419,20 +424,35 @@ function adoptMisplacedReports(run, stage, vars, t0) {
 // ---- refresh rules on resume ----
 // A run keeps the stage list it started with, so pipeline fixes (e.g. the bold-tolerant verdict regexes, #15)
 // never reached runs already in flight. On resume, copy the current pipeline's verdict rules onto matching
-// stages. Expanded foreach stages (id#N) only get rework.failRegex/max: their checks embed per-item values.
+// stages, plus turn/time limits and newly added rework loops. Expanded foreach stages (id#N) get their check
+// re-filled with the run vars and their item number; a check that needs other per-item values is left alone.
 function refreshStages(run) {
   let pipe; try { pipe = JSON.parse(fs.readFileSync(path.join(PIPES, run.pipeline + '.json'), 'utf8')); } catch { return 0; }
   const tpl = {};
   const walk = (stages) => { for (const s of stages || []) { if (s.id && !(s.id in tpl)) tpl[s.id] = s; if (s.type === 'foreach') walk(s.stages); } };
   walk(pipe.stages);
   let changed = 0;
+  // Runs started before vars were normalised hold Windows paths; backslashes break the JS checks they fill.
+  for (const k of ['home', 'soft', 'workdir']) if (typeof run.vars?.[k] === 'string' && run.vars[k].includes('\\')) { run.vars[k] = toSlash(run.vars[k]); changed++; }
+  const esc = (o) => Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, JSON.stringify(String(v ?? '')).slice(1, -1)]));
   for (const s of run.stages || []) {
+    const m = /#(\d+)$/.exec(String(s.id || ''));
     const t = tpl[String(s.id || '').replace(/#\d+$/, '')];
     if (!t) continue;
     // a foreach not expanded yet has no per-item values: take its inner stages from the template wholesale
     if (s.type === 'foreach' && t.type === 'foreach') { if (JSON.stringify(s.stages) !== JSON.stringify(t.stages)) { s.stages = JSON.parse(JSON.stringify(t.stages)); changed++; } continue; }
-    if (s.rework && t.rework) for (const k of ['failRegex', 'max']) if (t.rework[k] !== undefined && s.rework[k] !== t.rework[k]) { s.rework[k] = t.rework[k]; changed++; }
-    if (!/#\d+$/.test(s.id) && t.check && s.check !== t.check) { s.check = t.check; changed++; }
+    // turn and time limits carry no per-item values
+    for (const k of ['maxTurns', 'timeoutMin']) if (t[k] !== undefined && s[k] !== t[k]) { s[k] = t[k]; changed++; }
+    if (t.rework && !s.rework) { // a stage that gained a rework loop since the run started
+      s.rework = JSON.parse(JSON.stringify(t.rework));
+      if (m) s.rework.verdict = fill(s.rework.verdict, { ...run.vars, n: Number(m[1]) });
+      changed++;
+    } else if (s.rework && t.rework) for (const k of ['failRegex', 'max']) if (t.rework[k] !== undefined && s.rework[k] !== t.rework[k]) { s.rework[k] = t.rework[k]; changed++; }
+    if (t.check) {
+      // an expanded stage's check embeds its item number: re-fill the template, and use it only if nothing is left unfilled
+      const want = m ? fill(t.check, { ...esc(run.vars), n: Number(m[1]) }) : t.check;
+      if (!(m && /\{\{\w+\}\}/.test(want)) && s.check !== want) { s.check = want; changed++; }
+    }
   }
   return changed;
 }
