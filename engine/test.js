@@ -14,6 +14,7 @@ const SUITES = [
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
+  { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
 ];
 
 let anyFailed = false;

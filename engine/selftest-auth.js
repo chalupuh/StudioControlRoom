@@ -22,7 +22,7 @@ const crypto = require('crypto');
 const os = require('os');
 
 // ---- helpers ----
-const HOME = process.cwd();
+const HOME = path.resolve(__dirname, '..');
 const DIR = path.join(HOME, '.studio');
 const tests = { pass: 0, fail: 0, errors: [] };
 
@@ -86,8 +86,10 @@ const auth = require('../studio/auth');
   t('isPrivateIP: 172.32.0.1 -> false (outside /12)', !auth.isPrivateIP('172.32.0.1'));
   t('isPrivateIP: 8.8.8.8 -> false (public)', !auth.isPrivateIP('8.8.8.8'));
   t('isPrivateIP: 203.0.113.5 -> false (public)', !auth.isPrivateIP('203.0.113.5'));
-  t('isPrivateIP: fd00::1 -> true (ULA)', auth.isPrivateIP('fd00::1'));
-  t('isPrivateIP: fe80::1 -> true (link-local)', auth.isPrivateIP('fe80::1'));
+  t('isPrivateIP: fd00::1 -> false (not in spec)', !auth.isPrivateIP('fd00::1'));
+  t('isPrivateIP: fe80::1 -> false (not in spec)', !auth.isPrivateIP('fe80::1'));
+  t('isPrivateIP: 169.254.1.1 -> false (link-local not in spec)', !auth.isPrivateIP('169.254.1.1'));
+  t('isPrivateIP: :: -> false', !auth.isPrivateIP('::'));
 
   // Rate limiter
   const store = auth.createRateStore();
@@ -196,15 +198,23 @@ const auth = require('../studio/auth');
   rlMid(rlIp, mockRes());
   t('middleware: 6th attempt -> 429 rate limited', lastStatus === 429);
 
-  // --- 10) After success, rate limit resets ---
+  // --- 10) Locked-out IP is refused even with a valid token ---
   lastStatus = 999;
   const rlOkReq = { connection: { remoteAddress: '10.0.0.50' }, headers: { authorization: `Bearer ${midToken}` } };
   rlMid(rlOkReq, mockRes());
-  t('middleware: valid token resets rate limit', lastStatus === 999);
-  // Next bad request should get 401 (not 429)
+  t('middleware: locked-out IP with valid token -> 429', lastStatus === 429);
+
+  // --- 11) Success resets the failure counter; only failures count ---
+  const rsStore = auth.createRateStore();
+  const rsMid = auth.makeAuthMiddleware(mockJsonFn, MID_STUDIO, rsStore);
+  const rsGood = { connection: { remoteAddress: '10.0.0.51' }, headers: { authorization: `Bearer ${midToken}` } };
+  const rsBad = { connection: { remoteAddress: '10.0.0.51' }, headers: { authorization: 'Bearer bad' } };
+  for (let i = 0; i < 4; i++) rsMid(rsBad, mockRes());
+  for (let i = 0; i < 10; i++) { lastStatus = 999; rsMid(rsGood, mockRes()); }
+  t('middleware: many valid requests never rate-limited', lastStatus === 999);
   lastStatus = 999;
-  rlMid(rlIp, mockRes());
-  t('middleware: after reset, bad token -> 401 (not 429)', lastStatus === 401);
+  rsMid(rsBad, mockRes());
+  t('middleware: after success reset, bad token -> 401 (not 429)', lastStatus === 401);
 
   // Cleanup middleware temp dir
   try { fs.rmSync(MID_DIR, { recursive: true, force: true }); } catch {}
@@ -212,11 +222,21 @@ const auth = require('../studio/auth');
   // ========== INTEGRATION: spawn server ==========
   console.log('\n[integration] spawned server\n');
 
-  // Pick a free port
-  await new Promise(resolve => {
+  // Pick free ports
+  const freePort = () => new Promise(resolve => {
     const s = require('net').createServer();
-    s.listen(0, '127.0.0.1', () => { PORT = s.address().port; s.close(resolve); });
+    s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); });
   });
+  const waitPort = async (port) => {
+    for (let i = 0; i < 100; i++) {
+      const ok = await new Promise((r) => { const c = require('net').connect(port, '127.0.0.1', () => { c.destroy(); r(true); }); c.on('error', () => r(false)); });
+      if (ok) return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  };
+  PORT = await freePort();
+  const PORT2 = await freePort();
 
   // Use a temporary HOME dir to avoid polluting real state.
   // The server sets DIR = path.join(HOME, '.studio'), so we put files under .studio/
@@ -247,7 +267,7 @@ const auth = require('../studio/auth');
   child.stderr.on('data', c => outBuf += c);
 
   // Wait for server ready
-  await new Promise(r => setTimeout(r, 2000));
+  await waitPort(PORT);
 
   // Verify server is listening and LAN mode is enabled
   t('server started without crashing', child.exitCode === null);
@@ -258,16 +278,17 @@ const auth = require('../studio/auth');
   t('/api/state has events array', Array.isArray(loopback.body?.events));
   t('/api/state has control object', typeof loopback.body?.control === 'object');
 
-  // ---- 2) GET /api/state WITH valid token -> 200 (still from loopback, but token is valid) ----
+  // ---- 2/3) Loopback ignores token headers (auth is only enforced for LAN sources; see 11b) ----
   const withToken = await req({ url: '/api/state', headers: { Authorization: `Bearer ${testToken}` } });
-  t('GET /api/state with valid Bearer token -> 200', withToken.status === 200);
+  t('loopback ignores Bearer header -> 200', withToken.status === 200);
+  const cookieOk = await req({ url: '/api/state', headers: { Cookie: `studio_token=${testToken}` } });
+  t('loopback ignores cookie header -> 200', cookieOk.status === 200);
 
-  // ---- 3) Cookie-based auth (from loopback, token valid) ----
-  const cookieOk = await req({
-    url: '/api/state',
-    headers: { Cookie: `studio_token=${testToken}` }
-  });
-  t('GET /api/state with valid cookie -> 200', cookieOk.status === 200);
+  // ---- 3b) Host / Origin checks (DNS rebinding, CSRF) ----
+  t('foreign Host header -> 403', (await req({ url: '/api/state', headers: { Host: 'evil.example.com' } })).status === 403);
+  t('foreign Host header on /api/pair-qr -> 403', (await req({ url: '/api/pair-qr', headers: { Host: 'rebind.example:' + PORT } })).status === 403);
+  t('POST with foreign Origin -> 403', (await req({ url: '/control', method: 'POST', body: { action: 'pause' }, headers: { Origin: 'http://evil.example.com' } })).status === 403);
+  t('POST with matching Origin -> 200', (await req({ url: '/control', method: 'POST', body: { action: 'resume' }, headers: { Origin: `http://127.0.0.1:${PORT}`, Host: `127.0.0.1:${PORT}` } })).status === 200);
 
   // ---- 4) GET /pair?t=<valid-token> -> 302 with Set-Cookie ----
   const pairResp = await req({ url: `/pair?t=${testToken}` });
@@ -322,12 +343,55 @@ const auth = require('../studio/auth');
   const pairPost = await req({ url: '/api/pair', method: 'POST', body: {} });
   t('POST /api/pair does NOT return token (no unauthenticated minting)', pairPost.status !== 200 || !pairPost.body?.token);
 
+  // ---- 11b) LAN-source requests (source IP is a private non-loopback address of this host) ----
+  // Connect to our own LAN IPv4 so the server sees a private, non-loopback peer and enforces auth.
+  // Virtual NICs (WSL/Hyper-V/Docker...) are skipped here to avoid connecting to unexpected addresses
+  // and triggering the Windows "allow node.exe" firewall prompt. The server includes them (sorted last),
+  // but this test prefers physical NICs for the LAN-source checks.
+  const lanIp = [].concat(...Object.entries(os.networkInterfaces()).filter(([n]) => !/vEthernet|WSL|Hyper-V|Docker|VirtualBox|VMware|Loopback/i.test(n)).map(([, l]) => l || []))
+    .find((ni) => ni.family === 'IPv4' && !ni.internal && auth.isPrivateIP(ni.address))?.address;
+  if (!lanIp) {
+    console.log('  (skipped: host has no private IPv4 address; LAN-source checks not run)');
+  } else {
+    const lanReq = (url, headers = {}, method = 'GET') => new Promise((resolve) => {
+      const r = http.request({ hostname: lanIp, port: PORT, path: url, method, headers, timeout: 5000 }, (res) => {
+        let d = ''; res.on('data', (c) => d += c);
+        res.on('end', () => resolve({ status: res.statusCode, body: d, headers: res.headers }));
+      });
+      r.on('error', () => resolve({ status: 0 })); r.end();
+    });
+    const bad = { Authorization: 'Bearer ' + 'f'.repeat(64) };
+    t('LAN: /api/state without token -> 401', (await lanReq('/api/state')).status === 401);
+    t('LAN: /api/state with Bearer -> 200', (await lanReq('/api/state', { Authorization: `Bearer ${testToken}` })).status === 200);
+    t('LAN: /api/state with cookie -> 200', (await lanReq('/api/state', { Cookie: `studio_token=${testToken}` })).status === 200);
+    t('LAN: /api/pair-qr with Bearer -> SVG', (await lanReq('/api/pair-qr', { Authorization: `Bearer ${testToken}` })).body.includes('<svg'));
+    // Each unauthenticated request is a failure (5 -> lockout); a valid request resets the counter.
+    const good = { Authorization: `Bearer ${testToken}` };
+    let n = 0;
+    const denied = async (name, p, method) => {
+      if (n++ % 3 === 2) await lanReq('/api/state', good);
+      t(`LAN: ${name} without token -> 401`, (await lanReq(p, {}, method)).status === 401);
+    };
+    for (const p of ['/control', '/checkpoints', '/models', '/events', '/v1', '/portraits/x.png', '/village/x.png', '/api/stream']) await denied(p, p);
+    await denied('POST /control pause', '/control', 'POST');
+    await denied('removed /api/test/reset-rate-limit', '/api/test/reset-rate-limit', 'POST');
+    await lanReq('/api/state', good);
+    const pairLan = await lanReq(`/pair?t=${testToken}`);
+    t('LAN: /pair valid token -> 302 with persistent cookie', pairLan.status === 302 && /Max-Age=\d+/.test(String(pairLan.headers['set-cookie'])) && pairLan.headers['cache-control'] === 'no-store');
+    t('LAN: wrong token -> 401', (await lanReq('/api/state', bad)).status === 401);
+    let last = 0;
+    for (let i = 0; i < 5; i++) last = (await lanReq('/api/state', bad)).status;
+    t('LAN: repeated failures -> 429', last === 429);
+    t('LAN: valid token refused while locked out -> 429', (await lanReq('/api/state', { Authorization: `Bearer ${testToken}` })).status === 429);
+  }
+
   // ---- 12) `studio.js token rotate` CLI ----
   await new Promise(r => setTimeout(r, 500));
   const rotateResult = spawnSync(process.execPath, [path.join(HOME, 'studio', 'studio.js'), 'token', 'rotate'], {
     cwd: HOME, env: { ...process.env, STUDIO_HOME: TEST_DIR }, encoding: 'utf8', timeout: 10000
   });
   t('token rotate exits 0', rotateResult.status === 0);
+  t('token rotate output includes re-pair hint', /re-pair|re.pair/i.test(rotateResult.stdout));
   const rotatedAuth = JSON.parse(fs.readFileSync(path.join(TEST_STUDIO, 'auth.json'), 'utf8'));
   t('token rotate produces new token', rotatedAuth.token !== testToken);
   t('token rotate new token is 64 hex chars', rotatedAuth.token.length === 64);
@@ -346,12 +410,16 @@ const auth = require('../studio/auth');
 
   // ---- 15) machine.json fallback (unit-level: check getLanBind reads it) ----
   // Write a machine.json with controlRoom.bind and verify it's read
-  const mcFile = path.join(TEST_DIR, 'machine.json');
-  fs.writeFileSync(mcFile, JSON.stringify({ controlRoom: { bind: '10.0.0.5' } }, null, 2));
-  // We can't easily test the bind address of an already-running server, but we verified
-  // STUDIO_BIND was respected above. The code path for machine.json fallback is in getLanBind()
-  // and is exercised by the same function.
-  t('machine.json created with controlRoom.bind', JSON.parse(fs.readFileSync(mcFile, 'utf8')).controlRoom.bind === '10.0.0.5');
+  // Spawn a second server with STUDIO_BIND unset and .studio/machine.json controlRoom.bind=0.0.0.0.
+  fs.writeFileSync(path.join(TEST_STUDIO, 'machine.json'), JSON.stringify({ controlRoom: { bind: '0.0.0.0' } }));
+  const env2 = { ...process.env, STUDIO_HOME: TEST_DIR, PORT: String(PORT2) };
+  delete env2.STUDIO_BIND;
+  const child2 = spawn(process.execPath, [path.join(HOME, 'studio', 'studio.js'), 'serve', String(PORT2)], { cwd: HOME, stdio: ['ignore', 'pipe', 'pipe'], env: env2 });
+  let out2 = '';
+  child2.stdout.on('data', (c) => out2 += c); child2.stderr.on('data', (c) => out2 += c);
+  await waitPort(PORT2);
+  t('machine.json controlRoom.bind fallback -> LAN mode banner', out2.toLowerCase().includes('lan mode'));
+  child2.kill();
 
   // Cleanup server
   child.kill();

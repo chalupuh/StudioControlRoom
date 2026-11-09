@@ -9,11 +9,11 @@
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
 //   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
 //   node studio/studio.js token [rotate]                  <- show current token / rotate it
+//   node studio/studio.js pair [port]                     <- LAN pairing URL(s) + QR code for a phone
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const os = require('os');
-const crypto = require('crypto');
 
 // Auth: extracted to testable module; studio-local functions delegate to it.
 const auth = require('./auth');
@@ -213,6 +213,8 @@ function verifyToken(provided) {
 
 // ---- LAN bind address ----
 // Read machine.json profile (HOME/.studio/machine.json).
+// TODO(lane merge): Lane H's studio/machine.js loads the same file (with defaults + bad-JSON warning).
+// When the lanes merge, replace readMachineConfig/getLanBind with require('./machine').load().controlRoom.bind.
 function readMachineConfig() {
   try { return JSON.parse(fs.readFileSync(path.join(DIR, 'machine.json'), 'utf8')); } catch { return {}; }
 }
@@ -227,49 +229,66 @@ function getLanBind() {
   return '127.0.0.1';
 }
 
+// ---- Pairing (phone on the LAN) ----
+// One entry per private IPv4 address of this host; each is a ready-to-open pairing link.
+// Virtual adapters (WSL, Hyper-V, Docker, VPN...) are sorted last instead of dropped —
+// a Hyper-V External switch can hold the host's real LAN address.
+// Home /24 (192.168.x) addresses sort first. Result is cached for 30 s.
+const VIRTUAL_NIC = /vEthernet|WSL|Hyper-V|Docker|VirtualBox|VMware|Loopback/i;
+let _lanCache = { at: 0, val: null };
+const LAN_CACHE_TTL = 30000;
+function lanAddresses(ifaces) {
+  if (ifaces === undefined) {
+    if (Date.now() - _lanCache.at < LAN_CACHE_TTL && _lanCache.val !== null) return _lanCache.val;
+    ifaces = os.networkInterfaces();
+  }
+  const out = [];
+  const virtual = [];
+  for (const [name, list] of Object.entries(ifaces)) {
+    const isVirtual = VIRTUAL_NIC.test(name);
+    for (const ni of list || []) {
+      if (ni.family !== 'IPv4' || ni.internal || !auth.isPrivateIP(ni.address)) continue;
+      (isVirtual ? virtual : out).push(ni.address);
+    }
+  }
+  const result = [...new Set([...out, ...virtual])].sort(
+    (a, b) => Number(b.startsWith('192.168.')) - Number(a.startsWith('192.168.'))
+  );
+  if (ifaces === os.networkInterfaces() || ifaces === undefined) {
+    _lanCache = { at: Date.now(), val: result };
+  }
+  return result;
+}
+// preferHost: the Host header the browser used; if it is one of our LAN addresses it goes first.
+function lanPairUrls(port, token, preferHost) {
+  const addrs = lanAddresses();
+  const h = String(preferHost || '').replace(/:\d+$/, '');
+  const i = addrs.indexOf(h);
+  if (i > 0) addrs.unshift(addrs.splice(i, 1)[0]);
+  return addrs.map((a) => `http://${a}:${port}/pair?t=${token}`);
+}
+
+const isLoopbackBind = (b) => /^(127(\.\d{1,3}){3}|::1|localhost)$/i.test(String(b || '').trim());
+
+function pairCommand(rest) {
+  const qr = require('./qr');
+  const port = Number(rest[0]) || Number(process.env.PORT) || 4777;
+  const urls = lanPairUrls(port, ensureToken().token);
+  if (!urls.length) { console.log('No private LAN IPv4 address found on this host.'); process.exitCode = 1; return; }
+  const bind = getLanBind();
+  if (isLoopbackBind(bind)) {
+    console.log(`Note: the server is bound to ${bind} (loopback only). Set STUDIO_BIND=0.0.0.0 (or controlRoom.bind in machine.json) and restart, or a phone cannot connect.\n`);
+  }
+  console.log('Open one of these on your phone (same Wi-Fi/LAN):');
+  for (const u of urls) console.log('  ' + u);
+  console.log('\n' + qr.toTerminal(qr.encode(urls[0])) + '\n');
+  console.log('(QR is for the first link. It is drawn for dark terminals; on a light terminal, invert colours or use a link.)');
+  console.log('If the phone cannot connect, allow the port: powershell -File studio\\firewall.ps1 -Port ' + port);
+}
+
 // ---- Auth state ----
 const rateStore = auth.createRateStore();
 let _isLanMode = false;
-
-// ---- Auth middleware ----
-// Returns (req, res) => true|false. false = wrote 401/429/403 and ended response.
-// Loops back (127.0.0.1/::1) always skip auth. Non-private IPs get 403.
-function makeAuthMiddleware(json) {
-  return (req, res) => {
-    const ip = auth.rateLimitKey(req);
-
-    // loopback always skips auth
-    if (ip === '127.0.0.1' || ip === '::1') return true;
-
-    // reject non-private source IPs with 403
-    if (!auth.isPrivateIP(ip)) {
-      json(res, { error: 'forbidden' }, 403);
-      return false;
-    }
-
-    // rate limit: 5 failed attempts per IP per 60 s
-    if (!auth.checkRateLimit(ip, rateStore)) {
-      json(res, { error: 'rate limited' }, 429);
-      return false;
-    }
-
-    // extract token from Bearer header or HttpOnly cookie
-    let token = req.headers['authorization']?.replace(/^Bearer\s+/i, '');
-    if (!token) {
-      const cookies = auth.parseCookies(req.headers['cookie'] || '');
-      token = cookies.studio_token || null;
-    }
-
-    if (!verifyToken(token)) {
-      json(res, { error: 'unauthorized' }, 401);
-      return false;
-    }
-
-    // success: reset failure counter
-    auth.resetRateLimit(ip, rateStore);
-    return true;
-  };
-}
 
 function runSummary(run) {
   const cur = run.cursor || 0;
@@ -384,7 +403,7 @@ function startWatchers() {
   setInterval(() => { for (const c of clients) { try { c.write(': hb\n\n'); } catch {} } }, 15000).unref?.();
 }
 
-const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.json': 'application/json', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.map': 'application/json' };
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.json': 'application/json', '.ico': 'image/x-icon', '.woff2': 'font/woff2', '.map': 'application/json' };
 function sendFile(res, file, extraHeaders = {}) {
   const ext = path.extname(file).toLowerCase();
   res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', ...extraHeaders });
@@ -426,25 +445,39 @@ function serve(port = 4777) {
 
   // Determine bind address and LAN mode
   const bindAddr = getLanBind();
-  _isLanMode = (bindAddr !== '127.0.0.1' && bindAddr !== '::1');
+  _isLanMode = !isLoopbackBind(bindAddr);
 
   // Ensure token exists when in LAN mode
   if (_isLanMode) ensureToken();
 
-  const authMiddleware = makeAuthMiddleware(json);
+  const authMiddleware = auth.makeAuthMiddleware(json, DIR, rateStore);
   startWatchers();
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname, m = req.method;
 
+    // ---- defence in depth: source IP, Host (DNS rebinding) and Origin (CSRF) ----
+    if (_isLanMode && !auth.isPrivateIP(auth.rateLimitKey(req))) return json(res, { error: 'forbidden' }, 403);
+    const hostName = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
+    if (!['localhost', '127.0.0.1', '[::1]', bindAddr.toLowerCase(), ...lanAddresses()].includes(hostName)) return json(res, { error: 'forbidden host' }, 403);
+    if (m !== 'GET' && m !== 'HEAD' && req.headers.origin) {
+      let oh = ''; try { oh = new URL(req.headers.origin).host.toLowerCase(); } catch {}
+      if (oh !== String(req.headers.host || '').toLowerCase()) return json(res, { error: 'forbidden origin' }, 403);
+    }
+
     // ---- /pair: validate token, set HttpOnly cookie, redirect to / ----
     if (p === '/pair' && m === 'GET') {
       const tParam = url.searchParams.get('t');
+      // LAN: same IP check + failure rate limit as /api/* (no unlimited guessing here)
+      if (_isLanMode && !tParam) return json(res, { error: 'unauthorized' }, 401);
+      if (_isLanMode && !authMiddleware.check(req, res, tParam)) return;
       if (tParam && verifyToken(tParam)) {
         res.writeHead(302, {
           'Location': '/',
-          'Set-Cookie': `studio_token=${tParam}; HttpOnly; SameSite=Strict; Path=/`,
+          'Set-Cookie': `studio_token=${tParam}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+          'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
         });
         res.end();
         return;
@@ -455,6 +488,9 @@ function serve(port = 4777) {
       res.end();
       return;
     }
+
+    // ---- auth gate (LAN mode): everything except /pair and the static SPA shell ----
+    if (_isLanMode && /^\/(api\/|control$|checkpoints$|models$|events$|v1$|portraits\/|village\/)/.test(p) && !authMiddleware(req, res)) return;
 
     // ---- legacy endpoints (used by dashboard.html) ----
     if (p === '/control') {
@@ -471,10 +507,17 @@ function serve(port = 4777) {
     if (p === '/events') return json(res, readEvents());
     if (p === '/v1') return sendFile(res, html, { 'Cache-Control': 'no-store' });
 
-    // ---- v2 API (auth required when in LAN mode) ----
+    // ---- v2 API (auth already enforced by the gate above in LAN mode) ----
     if (p.startsWith('/api/')) {
-      if (_isLanMode && !authMiddleware(req, res)) return;
       if (p === '/api/state' && m === 'GET') return json(res, getState());
+      if (p === '/api/pair-qr' && m === 'GET') {
+        if (!_isLanMode) return json(res, { error: 'LAN mode is off: set STUDIO_BIND or controlRoom.bind' }, 409);
+        const qr = require('./qr');
+        const urls = lanPairUrls(port, ensureToken().token, req.headers.host);
+        if (!urls.length) return json(res, { error: 'no LAN address' }, 404);
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+        return res.end(qr.toSvg(qr.encode(urls[0])));
+      }
       if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
       if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
       if (p === '/api/stream' && m === 'GET') {
@@ -526,11 +569,6 @@ function serve(port = 4777) {
         if (!isFile(full)) return text(res, 'not found', 404);
         return text(res, fs.readFileSync(full, 'utf8'));
       }
-      // /api/test/reset-rate-limit: clear rate limiter (for selftests only)
-      if (p === '/api/test/reset-rate-limit' && m === 'POST') {
-        rateStore.clear();
-        return json(res, { ok: true });
-      }
       return json(res, { error: 'not found' }, 404);
     }
 
@@ -574,20 +612,21 @@ else if (cmd === 'resume') console.log(setControl('running'));
 else if (cmd === 'status') { console.log(getControl()); for (const c of listCheckpoints()) console.log('\n' + c.text); }
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
-else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
+else if (cmd === 'serve') serve(Number(rest[0]) || Number(process.env.PORT) || 4777);
 else if (cmd === 'token') {
   // token subcommands: show current token, or rotate (create/replace)
   const sub = rest[0];
   if (sub === 'rotate') {
     writeAuth({ token: generateToken(), created: Date.now() });
-    console.log(`Token rotated.`);
+    console.log(`Token rotated. Re-pair devices with "studio.js pair"; existing cookies and links stop working.`);
   } else {
     // Show current token (create if missing)
     const a = ensureToken();
     console.log(`Token: ${a.token}`);
   }
 }
+else if (cmd === 'pair') pairCommand(rest);
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | token [rotate]');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | token [rotate] | pair [port]');

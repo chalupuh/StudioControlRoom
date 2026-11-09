@@ -33,7 +33,11 @@ function readAuth(dir) {
  * @param {{token:string,created:number}} auth
  */
 function writeAuth(dir, auth) {
-  fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify(auth, null, 2));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'auth.json');
+  const tmp = file + '.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(auth, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
 }
 
 /**
@@ -122,6 +126,25 @@ function checkRateLimit(ip, store, windowMs, limit, nowMs) {
 }
 
 /**
+ * True if this IP already has RATE_LIMIT failed attempts in the current window.
+ * @param {string} ip
+ * @param {Map} store
+ * @param {number} [nowMs]
+ */
+function isRateLimited(ip, store, nowMs) {
+  const now = nowMs != null ? nowMs : Date.now();
+  const b = store.get(ip);
+  if (!b) return false;
+  if (now - b.start > RATE_WINDOW_MS) { store.delete(ip); return false; }
+  return b.count >= RATE_LIMIT;
+}
+
+/** Record one failed auth attempt for this IP. */
+function recordFailure(ip, store, nowMs) {
+  checkRateLimit(ip, store, undefined, undefined, nowMs);
+}
+
+/**
  * Record a successful auth, resetting the failure counter for this IP.
  * @param {string} ip
  * @param {Map} store
@@ -146,7 +169,7 @@ function resetRateLimit(ip, store) {
  * @returns {(req,res)=>boolean}
  */
 function makeAuthMiddleware(jsonFn, dir, store) {
-  return (req, res) => {
+  const mw = (req, res, tokenOverride) => {
     const ip = rateLimitKey(req);
 
     // loopback always skips auth
@@ -158,14 +181,14 @@ function makeAuthMiddleware(jsonFn, dir, store) {
       return false;
     }
 
-    // check rate limit (only failed attempts count, but we check before token)
-    if (!checkRateLimit(ip, store)) {
+    // locked out after 5 failed attempts in the window (even a valid token is refused)
+    if (isRateLimited(ip, store)) {
       jsonFn(res, { error: 'rate limited' }, 429);
       return false;
     }
 
     // extract token from Bearer header or cookie
-    let token = req.headers['authorization']?.replace(/^Bearer\s+/i, '');
+    let token = tokenOverride || req.headers['authorization']?.replace(/^Bearer\s+/i, '');
     if (!token) {
       // try cookie
       const cookies = parseCookies(req.headers['cookie'] || '');
@@ -174,6 +197,7 @@ function makeAuthMiddleware(jsonFn, dir, store) {
 
     const expected = currentToken(dir);
     if (!verifyToken(token, expected)) {
+      recordFailure(ip, store);
       jsonFn(res, { error: 'unauthorized' }, 401);
       return false;
     }
@@ -182,6 +206,9 @@ function makeAuthMiddleware(jsonFn, dir, store) {
     resetRateLimit(ip, store);
     return true;
   };
+  // mw.check(req, res, token): same checks with an explicit token (used by /pair)
+  mw.check = (req, res, token) => mw(req, res, token);
+  return mw;
 }
 
 // ---- Private IP helpers ----
@@ -190,9 +217,6 @@ function makeAuthMiddleware(jsonFn, dir, store) {
 function isPrivateIP(ip) {
   // loopback
   if (ip === '127.0.0.1' || ip === '::1') return true;
-  // link-local
-  if (ip === '169.254.0.0' || ip.startsWith('169.254.')) return true;
-
   // parse IPv4
   const parts = ip.split('.');
   if (parts.length === 4) {
@@ -204,9 +228,6 @@ function isPrivateIP(ip) {
     // 192.168.0.0/16
     if (a === 192 && b === 168) return true;
   }
-
-  // IPv6 loopback / local
-  if (ip === '::1' || ip === '::' || ip.startsWith('fd') || ip.startsWith('fe80')) return true;
 
   return false;
 }
@@ -235,6 +256,8 @@ module.exports = {
   rateLimitKey,
   checkRateLimit,
   resetRateLimit,
+  isRateLimited,
+  recordFailure,
   makeAuthMiddleware,
   isPrivateIP,
   parseCookies,
