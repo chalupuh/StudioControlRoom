@@ -165,7 +165,10 @@ function localTierEnv(tier, machineCfg = {}) {
 // Only build stages working in their own checkout (a lane worktree or app repo) commit. Stages that run in the
 // HQ checkout (R&D, research) or that only check work (QA, review) never commit: HQ sits on main with unrelated
 // runtime files, and git there goes through branch → PR → squash merge (ADR 0002).
-const commitsWork = (stage, cwd) => mustChange(stage) && cwd !== REPO;
+// Never on main/master either: internal pipelines use workdir={{soft}}, which is the main checkout if the
+// engine is ever run without a lane worktree.
+const currentBranch = (cwd) => { try { return spawnSync('git', ['branch', '--show-current'], { cwd, encoding: 'utf8' }).stdout.trim(); } catch { return ''; } };
+const commitsWork = (stage, cwd) => mustChange(stage) && !!cwd && cwd !== REPO && !['main', 'master'].includes(currentBranch(cwd));
 function unattendedRules(stage, cwd) {
   const git = commitsWork(stage, cwd)
     ? 'commit your changes to the current branch (git add <files> + git commit; never push, never switch branches)'
@@ -380,23 +383,31 @@ const isTracked = (dir, rel) => spawnSync('git', ['ls-files', '--error-unmatch',
 function adoptMisplacedReports(run, stage, vars, t0) {
   const wd = workdir(vars);
   if (wd === REPO) return [];
-  const targets = [...(stage.expect || []), ...(stage.rework && stage.rework.verdict ? [stage.rework.verdict] : [])];
+  // Only the per-round verdict report may replace an existing HQ file. Plain `expect` files can be shared,
+  // append-only HQ docs (docs/internal/sprint-log.md): those are only adopted when HQ has no copy at all.
+  const verdict = stage.rework && stage.rework.verdict ? fill(stage.rework.verdict, vars) : null;
+  const targets = [...(stage.expect || []).map((x) => fill(x, vars)), ...(verdict ? [verdict] : [])];
   const fresh = (p) => { try { return fs.statSync(p).mtimeMs >= t0 - 2000; } catch { return false; } };
   const moved = [];
-  for (const e of new Set(targets.map((x) => fill(x, vars)))) {
+  for (const e of new Set(targets)) {
     const dest = path.resolve(REPO, e);
     const rel = path.relative(REPO, dest);
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
     const src = path.join(wd, rel);
-    try { if (!fs.existsSync(src) || fs.lstatSync(src).isSymbolicLink() || !fresh(src)) continue; } catch { continue; }
-    if (fs.existsSync(dest)) {
-      if (fresh(dest)) continue; // the agent wrote the HQ copy too: that one wins
-      fs.renameSync(dest, dest.replace(/(\.[^./\\]+)?$/, (x) => `-stale${x || ''}`));
-    }
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    if (isTracked(wd, rel)) fs.copyFileSync(src, dest);
-    else { try { fs.renameSync(src, dest); } catch { fs.copyFileSync(src, dest); try { fs.unlinkSync(src); } catch {} } }
-    moved.push(toSlash(rel));
+    try {
+      if (!fs.existsSync(src) || fs.lstatSync(src).isSymbolicLink() || !fresh(src)) continue;
+      if (fs.existsSync(dest)) {
+        if (e !== verdict || fresh(dest)) continue; // shared HQ doc, or the agent wrote the HQ copy too: leave it
+        const stamp = new Date().toISOString().replace(/[-:.]/g, '').slice(0, 15);
+        let aside, i = 0; // never overwrite an older stale copy
+        do aside = dest.replace(/(\.[^./\\]+)?$/, (x) => `-stale-${stamp}${i ? '-' + i : ''}${x || ''}`), i++; while (fs.existsSync(aside));
+        fs.renameSync(dest, aside);
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (isTracked(wd, rel)) fs.copyFileSync(src, dest);
+      else { try { fs.renameSync(src, dest); } catch { fs.copyFileSync(src, dest); try { fs.unlinkSync(src); } catch {} } }
+      moved.push(toSlash(rel));
+    } catch (err) { console.log(`  ! could not adopt ${toSlash(rel)}: ${err.message}`); } // e.g. a locked file on Windows
   }
   if (moved.length) {
     run.history.push({ stage: stage.id, type: 'adopted-report', files: moved, at: now() });
@@ -426,7 +437,7 @@ function refreshStages(run) {
   return changed;
 }
 
-const hooks = { runAgent: (...a) => runAgent(...a), sleep: (ms) => sleepMs(ms) }; // test seams: selftests swap in fakes
+const hooks = { runAgent: (...a) => runAgent(...a), sleep: (ms, agentId) => sleepMs(ms, agentId) }; // test seams: selftests swap in fakes
 
 // ---- the state machine ----
 // ---- postmortem stubs (S2) ----

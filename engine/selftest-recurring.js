@@ -70,9 +70,22 @@ console.log('B. misplaced reports');
   // a stale HQ copy from an earlier round is moved aside and the fresh worktree report wins
   fs.writeFileSync(path.join(HOME, rel), 'old HQ copy'); fs.utimesSync(path.join(HOME, rel), old, old);
   fs.writeFileSync(path.join(wt, rel), 'fresh\nREQUEST CHANGES\n');
-  const m2 = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: [rel] }, { workdir: sl(wt) }, Date.now() - 1000);
-  check(m2.length === 1 && /fresh/.test(fs.readFileSync(path.join(HOME, rel), 'utf8')), 'fresh report replaces a stale HQ copy');
-  check(fs.existsSync(path.join(HOME, rel.replace(/\.md$/, '-stale.md'))), 'stale HQ copy kept as -stale.md');
+  const m2 = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: [rel], rework: { verdict: rel } }, { workdir: sl(wt) }, Date.now() - 1000);
+  check(m2.length === 1 && /fresh/.test(fs.readFileSync(path.join(HOME, rel), 'utf8')), 'fresh verdict report replaces a stale HQ copy');
+  check(fs.readdirSync(path.join(HOME, 'docs', 'internal')).some((f) => /^review-sprintX-stale-\d{8}T\d{6}\.md$/.test(f)), 'stale HQ copy kept as -stale-<time>.md');
+  // shared, append-only HQ docs in `expect` (the sprint log) are never replaced by a worktree copy
+  const log = 'docs/internal/sprint-log.md';
+  fs.writeFileSync(path.join(HOME, log), 'entry 1\nentry 2\nentry 3\n'); fs.utimesSync(path.join(HOME, log), old, old);
+  fs.writeFileSync(path.join(wt, 'docs', 'internal', 'sprint-log.md'), 'entry 4 only\n');
+  const m3 = engine.adoptMisplacedReports({ history: [] }, { id: 'build#1', expect: [log], rework: { verdict: 'docs/internal/qa/x.md' } }, { workdir: sl(wt) }, Date.now() - 1000);
+  check(m3.length === 0 && fs.readFileSync(path.join(HOME, log), 'utf8') === 'entry 1\nentry 2\nentry 3\n', 'HQ sprint log left unchanged by a worktree copy');
+  check(!fs.readdirSync(path.join(HOME, 'docs', 'internal')).some((f) => /sprint-log-stale/.test(f)), 'sprint log never moved aside');
+  // a second stale copy of a verdict report does not overwrite the first
+  fs.writeFileSync(path.join(HOME, rel), 'round A'); fs.utimesSync(path.join(HOME, rel), old, old);
+  fs.writeFileSync(path.join(wt, rel), 'round B');
+  engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: [rel], rework: { verdict: rel } }, { workdir: sl(wt) }, Date.now() - 1000);
+  const stales = fs.readdirSync(path.join(HOME, 'docs', 'internal')).filter((f) => /review-sprintX-stale/.test(f));
+  check(stales.length >= 2, 'each stale copy gets its own name (none overwritten)');
   // never escapes HQ
   const esc = engine.adoptMisplacedReports({ history: [] }, { id: 'review', expect: ['../outside.md'] }, { workdir: sl(wt) }, 0);
   check(esc.length === 0, 'paths outside HQ are ignored');
@@ -113,6 +126,10 @@ console.log('D. headless permissions and rules');
   const rb = engine.unattendedRules({ id: 'build#1' }, lane), rq = engine.unattendedRules({ id: 'review' }, lane), rh = engine.unattendedRules({ id: 'build#1' }, engine.REPO);
   check(/never ask/i.test(rb) && /never push/i.test(rb) && /git commit/.test(rb), 'lane build: unattended, commit, never push');
   check(/do NOT commit/.test(rq) && /do NOT commit/.test(rh), 'review and HQ stages are told not to commit');
+  // a build stage whose workdir is a checkout on main must not commit there
+  const onMain = path.join(HOME, 'main-checkout'); fs.mkdirSync(onMain, { recursive: true });
+  require('child_process').execSync('git init -q -b main', { cwd: onMain });
+  check(!engine.allowedToolsFor({ id: 'build#1' }, onMain).includes('Bash(git commit:*)') && /do NOT commit/.test(engine.unattendedRules({ id: 'build#1' }, onMain)), 'build in a checkout on main gets no commit rules or tools');
 }
 
 console.log('E. failure reason text');
