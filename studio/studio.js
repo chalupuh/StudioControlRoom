@@ -238,7 +238,8 @@ const VIRTUAL_NIC = /vEthernet|WSL|Hyper-V|Docker|VirtualBox|VMware|Loopback/i;
 let _lanCache = { at: 0, val: null };
 const LAN_CACHE_TTL = 30000;
 function lanAddresses(ifaces) {
-  if (ifaces === undefined) {
+  const live = ifaces === undefined;
+  if (live) {
     if (Date.now() - _lanCache.at < LAN_CACHE_TTL && _lanCache.val !== null) return _lanCache.val;
     ifaces = os.networkInterfaces();
   }
@@ -254,7 +255,7 @@ function lanAddresses(ifaces) {
   const result = [...new Set([...out, ...virtual])].sort(
     (a, b) => Number(b.startsWith('192.168.')) - Number(a.startsWith('192.168.'))
   );
-  if (ifaces === os.networkInterfaces() || ifaces === undefined) {
+  if (live) {
     _lanCache = { at: Date.now(), val: result };
   }
   return result;
