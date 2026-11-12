@@ -106,11 +106,13 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
   run.cursor = 1;
   run.reworkRecords = [{ id: 'qa#1:1', round: 1, max: 3, rejectedBy: 'qa#1', target: 'build#1', status: 'built', report: rpath, verdictReport: rpath, reportSha256: 'x', findings: [], baseline }];
   quiet(() => engine.advance(run));
-  check(run.status === 'blocked' && /no rework diff to verify/.test(run.blockedReason) && log.length === 0, 'empty manifest blocks QA before any model call');
-  // one changed file: QA proceeds with the manifest
-  edit(repo, 'a.js'); run.status = 'running'; delete run.blockedReason; cleanReport();
+  check(run.status === 'blocked' && /no rework diff to verify/.test(run.blockedReason) && log.length === 0 && run.history.some((h) => h.type === 'rework-empty-manifest'), 'empty manifest blocks QA before any model call');
+  check(run.reworkRecords[0].status === 'pending' && run.cursor === 0, 'S4: block marks the record pending and moves the cursor back to the rework builder');
+  // resume: the rework builder re-runs (and edits), then QA runs with the manifest
+  run.status = 'running'; delete run.blockedReason; cleanReport();
+  fake(repo, ['PASS'], (n, r) => { edit(r, 'a.js'); commitAll(r); }, log);
   quiet(() => engine.advance(run));
-  check(run.status === 'done' && /a\.js/.test(log[0].note), 'with a changed file QA runs and is told the manifest');
+  check(run.status === 'done' && log[0].id === 'build#1' && /a\.js/.test(log[1].note), 'S4: resume re-runs the builder, then QA is told the manifest');
 }
 // ---- cause 3: sprint-wide review reaches ONE sprint-rework stage that owns every task's findings ----
 {
@@ -148,6 +150,8 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
   const run = mkRun('b7', repo); quiet(() => engine.advance(run));
   const tiers = log.filter((l) => l.id === 'build#1').map((l) => l.tier);
   check(tiers.join() === 'local,local,sonnet', 'initial build, one capped local rework, then straight to sonnet (no second local try): ' + tiers.join());
+  const bl = log.filter((l) => l.id === 'build#1');
+  check(bl[1].opts.maxTurns === 30 && bl[2].tier === 'sonnet' && bl[2].opts.rework === true && bl[2].opts.maxTurns === undefined, 'N1: 30-turn rework cap on local only, cloud tier uses the stage maxTurns');
   const q = log.filter((l) => l.id === 'qa#1');
   check(q.length === 2 && run.status === 'done', 'QA only runs after the escalated rework produced an accepted result');
 }
@@ -164,9 +168,14 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
     'context_length_exceeded',
     'Conversation is too long to continue',
   ];
-  for (const s of strings) for (const isErr of [false, true]) {
-    const r = engine.parseRunOutput({ status: 0, stdout: j({ result: s, is_error: isErr }), stderr: '' });
-    check(!!r.error && !r.hitTurnCap, `limit text is an error (is_error=${isErr}): ${s.slice(0, 45)}`);
+  for (const s of strings) {
+    const r = engine.parseRunOutput({ status: 1, stdout: j({ result: s, is_error: true }), stderr: '' });
+    check(!!r.error && !r.hitTurnCap, `limit text on a failed run is an error: ${s.slice(0, 45)}`);
+  }
+  // S1: the old unconditional phrase still errors on a "successful" run; broader phrases need a failed run
+  check(!!engine.parseRunOutput({ status: 0, stdout: j({ result: "Claude's response exceeded the 32000 output token maximum.", is_error: false }), stderr: '' }).error, 'exceeded-N-output-token-maximum is an error even with ok:true');
+  for (const ok of ["Added 'prompt too long' handling to the limit regex.", 'Fixed the request too large path; context window exceeded case now retried.', 'Raised the output token limit docs.']) {
+    check(!engine.parseRunOutput({ status: 0, stdout: j({ result: ok, is_error: false }), stderr: '' }).error, 'short success mentioning a limit phrase is NOT an error: ' + ok.slice(0, 40));
   }
   const long = engine.parseRunOutput({ status: 0, stdout: j({ result: 'Report: ' + 'x'.repeat(700) + ' prompt is too long', is_error: false }), stderr: '' });
   check(!long.error, 'a long real report that mentions a limit is not an error');
@@ -177,6 +186,50 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
   fake(repo, ['FAIL', 'PASS'], (n, r) => { edit(r, n === 1 ? 'a.js' : 'b.js'); commitAll(r); return n === 1 ? {} : { error: 'prompt is too long', result: '' }; }, log);
   cleanReport(); const run = mkRun('b8', repo); quiet(() => engine.advance(run));
   check(run.status === 'blocked' && log.filter((l) => l.id === 'qa#1').length === 1, 'errored rework builds are never accepted and QA does not run');
+}
+
+// ---- N6: an old-style run (reworkNotes, no reworkRecords) resumes under the new engine ----
+{
+  cleanReport(); const repo = mkRepo('lane'); const log = [];
+  fake(repo, ['PASS'], (n, r) => { edit(r); commitAll(r); }, log);
+  const run = mkRun('b9', repo); run.reworkNotes = { 'build#1': 'Rework round 1: QA/review FAILED. Fix every finding in x-round1.md, then update the sprint log.' };
+  quiet(() => engine.advance(run));
+  const b = log.find((l) => l.id === 'build#1');
+  check(b.note.startsWith('Rework round 1') && !b.opts.rework, 'N6: legacy note is passed to the builder as before (no baseline needed)');
+  check(run.status === 'done' && !run.reworkNotes['build#1'] && !(run.reworkRecords || []).length, 'N6: legacy note consumed, run completes');
+}
+// ---- S2: in HQ (cwd === REPO) the sprint log and out-of-scope files do not count as a rework change ----
+{
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: HOME }); execFileSync('git', ['config', 'user.email', 't@e.com'], { cwd: HOME }); execFileSync('git', ['config', 'user.name', 't'], { cwd: HOME });
+  fs.writeFileSync(path.join(HOME, 'README.md'), 'hq\n'); execFileSync('git', ['add', 'README.md'], { cwd: HOME }); execFileSync('git', ['commit', '-qm', 'init'], { cwd: HOME, stdio: 'ignore' });
+  const logPath = path.join(HOME, 'docs', 'internal', 'sprint-log.md');
+  const hqStages = (extra) => [
+    { id: 'build#1', type: 'agent', agent: 'backend-dev', tier: 'local', task: 'b', expect: ['docs/internal/sprint-log.md'], ...extra },
+    { id: 'qa#1', type: 'agent', agent: 'qa-engineer', tier: 'local', task: 'qa', expect: [rpath], rework: { to: 'build', verdict: rpath, max: 3 } },
+  ];
+  const hqRun = (id, mode, extra) => {
+    cleanReport(); const log = []; const verdicts = ['FAIL', 'PASS'];
+    engine.hooks.runAgent = (stage, tier, vars, fb, note) => {
+      log.push({ id: stage.id, note });
+      if (stage.id === 'build#1') {
+        fs.mkdirSync(path.dirname(logPath), { recursive: true }); fs.appendFileSync(logPath, 'entry ' + Math.random() + '\n');
+        const n = log.filter((l) => l.id === 'build#1').length;
+        if (n === 1) { fs.mkdirSync(path.join(HOME, 'apps'), { recursive: true }); fs.writeFileSync(path.join(HOME, 'apps', 'first-' + id + '.js'), '1'); }
+        else if (mode === 'other') fs.writeFileSync(path.join(HOME, 'docs', 'other-lane-' + id + '.md'), 'x');
+        else if (mode === 'apps') fs.writeFileSync(path.join(HOME, 'apps', 'fix-' + id + '.js'), '2');
+        return { tier, model: 'x', secs: 0, result: 'built' };
+      }
+      fs.writeFileSync(rpath, REPORT(verdicts.shift())); return { tier, model: 'x', secs: 0, result: 'qa' };
+    };
+    const run = { id, pipeline: 't', vars: { home: sl(HOME), workdir: sl(HOME) }, stages: hqStages(extra), cursor: 0, gates: {}, history: [], status: 'running' };
+    quiet(() => engine.advance(run)); return { run, log };
+  };
+  let r = hqRun('h1', 'logonly', {});
+  check(r.run.status === 'blocked' && r.log.filter((l) => l.id === 'qa#1').length === 1, 'S2: writing only the sprint log is not a rework change in HQ');
+  r = hqRun('h2', 'other', { reworkPaths: ['apps/'] });
+  check(r.run.status === 'blocked', 'S2: a file outside the stage reworkPaths allowlist does not count');
+  r = hqRun('h3', 'apps', { reworkPaths: ['apps/'] });
+  check(r.run.status === 'done' && r.run.reworkRecords[0].changedPaths.join() === 'apps/fix-h3.js', 'S2: a change inside reworkPaths passes, manifest excludes the sprint log');
 }
 
 fs.rmSync(HOME, { recursive: true, force: true });

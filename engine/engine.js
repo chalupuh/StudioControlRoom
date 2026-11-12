@@ -116,11 +116,14 @@ const CONTEXT_LIMIT_RX = new RegExp([
   'maximum context length', 'input length and `?max_tokens`? exceed', 'request too large', 'request_too_large', 'context_length_exceeded',
   'conversation is too long', 'ran out of context',
 ].join('|'), 'i');
-const isCliErrorResult = (result) => {
+const OUTPUT_MAX_RX = /exceeded the \d+ output token maximum/i; // seen with ok:true in S4h history: unconditional
+// `failed` = the run itself failed (is_error / non-zero exit); the broader phrases only count then, so an honest
+// short summary that mentions "prompt too long" is not misread.
+const isCliErrorResult = (result, failed = false) => {
   const t = String(result || '').trim();
   // The limit phrases only count in a short, error-sized result, so a long real report that merely
   // mentions one (e.g. a review of this very check) is not misread as a failure.
-  return /^API Error:/i.test(t) || (t.length < 500 && CONTEXT_LIMIT_RX.test(t));
+  return /^API Error:/i.test(t) || (t.length < 500 && (OUTPUT_MAX_RX.test(t) || (failed && CONTEXT_LIMIT_RX.test(t))));
 };
 // A plan usage/rate limit ("You've hit your 5-hour limit · resets 4am") is not a failure of the stage: the
 // engine waits for the reset and retries the same tier (2026-11-09: every run blocked at ~2 AM on this).
@@ -144,7 +147,7 @@ function parseRunOutput(r) {
   // A CLI/API error printed as the "result" (e.g. "API Error: ... exceeded the 32000 output token maximum")
   // is not an answer: report it as an error so the attempt fails and climbs the tier ladder.
   // (is_error with a real result stays a partial success by design; see selftest.js.)
-  const cliError = isCliErrorResult(out.result);
+  const cliError = isCliErrorResult(out.result, !!hasFailure);
   return {
     turns: out.num_turns,
     result: String(out.result || '').slice(0, 2000),
@@ -265,7 +268,7 @@ function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
 function treeSnapshot(dir) {
   try {
     const git = (a) => require('child_process').execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return git(['rev-parse', 'HEAD']) + git(['status', '--porcelain']) + git(['diff']);
+    return git(['rev-parse', 'HEAD']) + git(['status', '--porcelain', '-uall']) + git(['diff']);
   } catch { return null; }
 }
 // Stages that must produce changes: explicit "mustChange": true, or any stage whose id starts with "build".
@@ -296,15 +299,20 @@ function gitState(dir) {
   const sha = head.trim();
   const diff = gitOut(dir, ['diff', 'HEAD']) || '';
   const files = Object.fromEntries(dirtyPaths(dir, sha).map((p) => [p, fileHash(dir, p)]));
-  return { head: sha, porcelain: gitOut(dir, ['status', '--porcelain']) || '', diffHash: sha256(diff), files };
+  return { head: sha, porcelain: gitOut(dir, ['status', '--porcelain', '-uall']) || '', diffHash: sha256(diff), files };
 }
 // Paths whose content differs from the baseline, committed or not. `exclude` = absolute paths (reports) to ignore.
-function changedSince(baseline, dir, exclude = []) {
+function changedSince(baseline, dir, exclude = [], only = null) {
   if (!baseline) return null;
+  const pre = (only || []).map((x) => toSlash(x).replace(/\/?$/, '/'));
   const ex = new Set(exclude.map((e) => toSlash(path.relative(dir, e))));
   const cand = new Set([...dirtyPaths(dir, baseline.head), ...Object.keys(baseline.files || {})]);
-  return [...cand].filter((p) => !ex.has(p) && !IGNORED_PATH.test(p) && (baseline.files && p in baseline.files ? baseline.files[p] !== fileHash(dir, p) : true)).sort();
+  return [...cand].filter((p) => !ex.has(p) && !IGNORED_PATH.test(p) && (!pre.length || pre.some((x) => p.startsWith(x))) && (baseline.files && p in baseline.files ? baseline.files[p] !== fileHash(dir, p) : true)).sort();
 }
+// Paths that are the stage's own output, not a fix: its expect files and the shared sprint log (and the rejected
+// report). Without this, writing the sprint log (or another lane's report in HQ) would count as "changed".
+const reworkExcludes = (rec, target, vars) => [rec.report, rec.verdictReport, path.join(REPO, 'docs', 'internal', 'sprint-log.md'),
+  ...((target && target.expect) || []).map((e) => path.resolve(REPO, fill(e, vars)))].map((p) => path.resolve(p));
 // Commit policy: a rework in a lane worktree (not HQ, not main/master) must commit, so HEAD has to advance.
 // On main or in HQ the engine/owner own git, so any scoped change vs the baseline is enough.
 const requiresCommit = (dir) => !!dir && dir !== REPO && !['main', 'master'].includes(currentBranch(dir));
@@ -317,7 +325,7 @@ function extractFindings(txt) {
   const out = []; let section = null;
   for (const raw of String(txt || '').split(/\r?\n/)) {
     const line = raw.trim();
-    if (!line || /VERDICT|REQUEST CHANGES|^APPROVE/i.test(line) && line.length < 60) continue;
+    if (!line || (/VERDICT|REQUEST CHANGES|^APPROVE/i.test(line) && line.length < 60)) continue;
     const heading = /^#{1,6}\s+(.*)$/.exec(line);
     const bullet = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
     if (heading && SEVERITY_RX.test(heading[1]) && heading[1].length < 50 && !FILEREF_RX.test(heading[1])) { section = (SEVERITY_RX.exec(heading[1]) || [])[1]; continue; }
@@ -726,11 +734,14 @@ function advance(run) {
     if (stage.rework && !rwRec) {
       const tgt = reworkTarget(run.stages, run.cursor, stage.rework.to, (stage.id.match(/#\d+$/) || [''])[0]);
       const vrec = tgt >= 0 ? activeRecord(run, run.stages[tgt].id, 'built') : null;
-      const manifest = vrec ? changedSince(vrec.baseline, cwd, [vrec.report, vrec.verdictReport].map((p) => path.resolve(p))) : null;
+      const manifest = vrec ? changedSince(vrec.baseline, cwd, reworkExcludes(vrec, run.stages[tgt], vars), run.stages[tgt].reworkPaths) : null;
       if (vrec && manifest) {
         if (!manifest.length) {
           run.status = 'blocked'; run.blockedReason = `${stage.id}: no rework diff to verify (nothing changed since the ${vrec.rejectedBy} rejection baseline ${short(vrec.baseline.head)})`;
-          writePostmortem(run, stage); save(run);
+          writePostmortem(run, stage);
+          // so `resume` re-runs the rework builder instead of re-evaluating the same empty manifest
+          run.history.push({ stage: stage.id, type: 'rework-empty-manifest', round: vrec.round, back: run.stages[tgt].id, at: now() });
+          vrec.status = 'pending'; run.cursor = tgt; save(run);
           ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. ${run.blockedReason}.` });
           console.log(`\n⛔ BLOCKED at ${stage.id}: ${run.blockedReason}`);
           return;
@@ -759,7 +770,7 @@ function advance(run) {
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
       const t0 = Date.now();
-      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote, rwRec ? { rework: true, maxTurns: rwTurns } : {});
+      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote, rwRec ? { rework: true, ...(TIERS[tierName].local ? { maxTurns: rwTurns } : {}) } : {});
       if (!rwRec && canFinalize(stage, res) && !paused(stage.agent)) {
         console.log(`  ↻ hit the turn cap after ${res.turns ?? '?'} turns; finalize turn to write the report`);
         const fin = hooks.runAgent(stage, tierName, vars, null, null, { resume: res.sessionId, prompt: finalizePrompt(stage, vars), maxTurns: FINALIZE_TURNS });
@@ -797,8 +808,7 @@ function advance(run) {
       // Rework builder (cause 1): success needs a scoped change vs the REJECTION baseline; in a lane worktree HEAD must advance too.
       let rwInfo = null;
       if (rwRec && rwRec.baseline && !res.error && !res.hitTurnCap) {
-        const exclude = [rwRec.report, rwRec.verdictReport].map((p) => path.resolve(p));
-        const changedPaths = changedSince(rwRec.baseline, cwd, exclude) || [];
+        const changedPaths = changedSince(rwRec.baseline, cwd, reworkExcludes(rwRec, stage, vars), stage.reworkPaths) || [];
         const afterHead = (gitState(cwd) || {}).head || null;
         rwInfo = { round: rwRec.round, beforeHead: rwRec.baseline.head, afterHead, changedPaths };
         if (!changedPaths.length) problems.push(`rework made no change since the rejection baseline (HEAD ${short(rwRec.baseline.head)}); fix the findings in the report, do not just re-run checks`);
