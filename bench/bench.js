@@ -48,7 +48,8 @@ async function chatOllama(model, messages, tools) {
 }
 
 // Shared CLI helpers. Both CLI providers run in a throwaway temp dir so a model can never touch the repo.
-const findCodex = () => require('../engine/engine.js').findCodex(); // same resolution as the engine (CODEX_EXE, machine.json, PATH)
+const codexPath = require('../engine/codex-path.js'); // same resolution and spawning as the engine
+const findCodex = () => codexPath.findCodex(process.env.STUDIO_HOME || null);
 
 function findClaude() {
   if (process.env.CLAUDE_EXE) return process.env.CLAUDE_EXE;
@@ -73,19 +74,11 @@ const flatPrompt = (messages) => {
 
 function spawnCli(exe, args, input) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-cli-'));
-  // Resolve .cmd/.bat npm shims to the actual module so we can spawn node directly
-  // (no shell) — avoids orphaned grandchildren when spawnSync times out.
-  let resolved = exe;
-  if (/\.(cmd|bat)$/i.test(exe)) {
-    const npmPrefix = path.dirname(path.dirname(process.execPath));
-    const modBin = path.join(npmPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-    if (fs.existsSync(modBin)) resolved = modBin;
-  }
   const t0 = Date.now();
   try {
-    const r = resolved !== exe
-      ? spawnSync(process.execPath, [resolved, ...args], { input, cwd: dir, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 })
-      : spawnSync(exe, args, { input, cwd: dir, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
+    // codex npm shims run via node directly; other .cmd shims (claude.cmd) go through a quoted shell command.
+    const spec = codexPath.codexSpawnSpec(exe, args);
+    const r = spawnSync(spec.command, spec.args, { shell: spec.shell, input, cwd: dir, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
     return { r, secs: (Date.now() - t0) / 1000 };
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }

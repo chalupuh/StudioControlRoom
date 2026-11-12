@@ -8,7 +8,8 @@ const EMPTY = path.join(HOME, 'empty');
 fs.mkdirSync(BIN, { recursive: true }); fs.mkdirSync(EMPTY);
 fs.mkdirSync(path.join(HOME, '.studio', 'runs'), { recursive: true });
 fs.mkdirSync(path.join(HOME, '.codex', 'agents'), { recursive: true });
-fs.writeFileSync(path.join(HOME, '.codex', 'agents', 'backend-dev.toml'), 'name = "backend-dev"\ndeveloper_instructions = """\nYou are the ROLE-MARKER engineer.\n"""\n');
+const WINP = ['C:', 'Users', 'x'].join(String.fromCharCode(92));
+fs.writeFileSync(path.join(HOME, '.codex', 'agents', 'backend-dev.toml'), ['name = "backend-dev"', "developer_instructions = '''", 'You are the ROLE-MARKER engineer.', 'Path ' + WINP + ' and """ quotes.', "'''", ''].join(String.fromCharCode(10)));
 process.env.STUDIO_HOME = HOME;
 // keep findCodex off any real install on this machine
 process.env.LOCALAPPDATA = EMPTY; process.env.HOME = EMPTY; delete process.env.CODX_EXE; delete process.env.CODEX_EXE;
@@ -63,6 +64,8 @@ const events = () => { try { return fs.readFileSync(path.join(HOME, '.studio', '
   check(call.argv[0] === 'exec' && call.argv.includes('--json'), 'runs `codex exec --json`');
   check(call.argv.join(' ').includes('--sandbox workspace-write'), 'sandbox workspace-write');
   check(fs.realpathSync(call.cwd) === fs.realpathSync(HOME), 'cwd = stage workdir');
+  check(call.stdin.includes('Path ' + WINP + ' and """ quotes.'), "''' fixture: backslash path and triple quotes reach the prompt verbatim");
+  check(!call.argv.includes('--add-dir') && !call.stdin.includes('Studio rules'), 'workdir = HQ: no --add-dir, no studio rules line');
   check(call.stdin.includes('ROLE-MARKER engineer') && call.stdin.includes('do the work') && call.stdin.includes('out.txt'), 'prompt = role instructions + stage task + expected files');
   const r2 = engine.runCodex(stage, vars, 'bad thing', null);
   check(/bad thing/.test(JSON.parse(fs.readFileSync(OUT, 'utf8')).stdin), 'feedback appended to the prompt');
@@ -78,18 +81,41 @@ const events = () => { try { return fs.readFileSync(path.join(HOME, '.studio', '
   withFake(); process.env.FAKE_CODEX_MODE = 'limited';
   const r = engine.runCodex(stage, vars, null, null);
   check(r.limited === true && /usage limit/.test(r.error), 'limited: JSONL usage-limit error marked limited');
+  try { fs.rmSync(path.join(HOME, '.studio', 'codex-limited.json')); } catch {}
   process.env.FAKE_CODEX_MODE = 'limited-stderr';
   const r2 = engine.runCodex(stage, vars, null, null);
   check(r2.limited === true, 'limited: stderr 429 rate limit marked limited');
+  // limited cache: the next call returns limited without spawning codex
+  fs.writeFileSync(OUT, 'untouched');
+  const r3 = engine.runCodex(stage, vars, null, null);
+  check(r3.limited === true && r3.cached === true && fs.readFileSync(OUT, 'utf8') === 'untouched', 'limited: cached, codex not spawned again');
+  fs.writeFileSync(path.join(HOME, '.studio', 'codex-limited.json'), JSON.stringify({ until: Date.now() - 1000 }));
+  process.env.FAKE_CODEX_MODE = 'success';
+  const r4 = engine.runCodex(stage, vars, null, null);
+  check(!r4.limited && r4.result === 'all done', 'limited: expired cache runs codex again');
+}
+
+// 3b. workdir outside HQ: HQ must be writable (--add-dir) and the Studio rules line is appended
+{
+  withFake(); process.env.FAKE_CODEX_MODE = 'success';
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-codex-wd-'));
+  engine.runCodex(stage, { ...vars, workdir: other.split(String.fromCharCode(92)).join('/') }, null, null);
+  const call = JSON.parse(fs.readFileSync(OUT, 'utf8'));
+  const i = call.argv.indexOf('--add-dir');
+  check(i > 0 && path.resolve(call.argv[i + 1]) === path.resolve(HOME), 'workdir outside HQ: --add-dir <HQ>');
+  check(call.argv[call.argv.length - 1] === '-', 'prompt still read from stdin (-)');
+  check(call.stdin.includes('Studio rules: work only inside this repository') && call.stdin.includes('Org docs, specs and backlogs live in'), 'workdir outside HQ: Studio rules line in the prompt');
+  try { fs.rmSync(other, { recursive: true, force: true }); } catch {}
 }
 // 4. missing binary
 {
+  try { fs.rmSync(path.join(HOME, '.studio', 'codex-limited.json')); } catch {}
   setPath(EMPTY); process.env.FAKE_CODEX_MODE = 'success';
   const before = events().length;
   const r = engine.runCodex(stage, vars, null, null);
   const warn = events().slice(before).find((e) => e.type === 'progress' && e.status === 'warning');
   check(r.skipped === true && r.result === '' && !r.limited, 'missing: tier skipped');
-  check(!!warn && /codex/.test(warn.message), 'missing: progress warning emitted');
+  check(!warn, 'missing: runCodex itself emits no warning (advance emits the single one)');
 }
 // 5. parseCodexOutput shape / plain events
 {
@@ -141,9 +167,31 @@ const events = () => { try { return fs.readFileSync(path.join(HOME, '.studio', '
     return { tier, model: 'x', secs: 0, result: '', error: 'boom' };
   };
   const run = mk('l3');
+  const nWarn0 = events().filter((e) => e.type === 'progress' && e.status === 'warning' && /codex unavailable/.test(e.message)).length;
   const l = console.log; console.log = () => {}; try { engine.advance(run); } finally { console.log = l; }
   check(tiers.join(',') === 'local,local,codex,sonnet' && run.status === 'done', 'ladder: skipped codex falls through to sonnet');
   check(!run.history.some((h) => h.tier === 'codex'), 'ladder: skipped codex not recorded in history');
+  check(events().filter((e) => e.type === 'progress' && e.status === 'warning' && /codex unavailable/.test(e.message)).length - nWarn0 === 1, 'ladder: exactly one unavailable warning per attempt');
+}
+
+// 9. codex-path: npm shim next to node_modules/@openai/codex/bin/codex.js runs through node, no shell; shell fallback quotes the exe
+{
+  const cpath = require('./codex-path.js');
+  const npm = path.join(HOME, 'npm dir');
+  fs.mkdirSync(path.join(npm, 'node_modules', '@openai', 'codex', 'bin'), { recursive: true });
+  const shim = path.join(npm, 'codex.cmd');
+  fs.writeFileSync(shim, ['@echo off', ''].join(String.fromCharCode(13, 10)));
+  const spec0 = cpath.codexSpawnSpec(shim, ['exec', '-']);
+  check(spec0.shell === true && spec0.command.startsWith('"' + shim + '"'), 'shim without module: shell fallback quotes an exe path with spaces');
+  const mod = path.join(npm, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  fs.writeFileSync(mod, ["require('fs').writeFileSync(process.env.FAKE_CODEX_OUT, JSON.stringify({ argv: process.argv.slice(2) }));", "console.log(JSON.stringify({ type: 'result', result: 'via module' }));", ''].join(String.fromCharCode(10)));
+  const spec1 = cpath.codexSpawnSpec(shim, ['exec', '-']);
+  check(spec1.shell === false && spec1.command === process.execPath && spec1.args[0] === mod && spec1.args[1] === 'exec', 'shim with module: node spawns the module, no shell');
+  process.env.CODEX_EXE = shim;
+  const r = engine.runCodex(stage, vars, null, null);
+  check(r.result === 'via module' && JSON.parse(fs.readFileSync(OUT, 'utf8')).argv[0] === 'exec', 'runCodex runs the module path end to end');
+  delete process.env.CODEX_EXE;
+  check(cpath.codexSpawnSpec('/usr/bin/codex', ['a']).shell === false, 'plain executable: no shell');
 }
 
 // N7: clean up temp directory

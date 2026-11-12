@@ -18,6 +18,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const codexPath = require('./codex-path.js');
 
 // REPO = the org workspace (STUDIO_HOME): agents, docs, pipelines, runtime data. The engine itself may live
 // elsewhere (StudioControlRoom). Resolution: STUDIO_HOME env → studio.home.json at the software root → legacy.
@@ -46,7 +47,7 @@ const providerOf = (tier) => (tier === 'codex' ? 'openai' : TIERS[tier] && TIERS
 const LADDER = {
   'local-fast': ['local-fast', 'local', 'codex', 'sonnet'],
   local:        ['local', 'local', 'codex', 'sonnet'],
-  codex:       ['codex', 'sonnet'],
+  codex:        ['codex', 'sonnet'],
   sonnet:       ['sonnet', 'opus'],
   opus:         ['opus'],
 };
@@ -99,6 +100,14 @@ function agentDefinition(name) {
   return def;
 }
 
+// The Studio rules line appended to every stage prompt that runs outside HQ (Claude and Codex alike).
+function studioRules(stage, cwd) {
+  const logCmd = cwd === REPO ? 'node .studio/studio.js' : `node "${STUDIO}"`;
+  return `
+
+Studio rules: work only inside this repository (${cwd}). Org docs, specs and backlogs live in ${REPO} (read-only unless the task says to write there). Report progress with \`${logCmd} log ${stage.agent} <pct> "<msg>"\`.`;
+}
+
 // ---- Codex runner (ADR 0004) ----
 
 // Minimal TOML parser for .codex/agents/<name>.toml files.
@@ -136,7 +145,7 @@ function parseSimpleTOML(src) {
       result[mMLSQ[1]] = parts.join('\n').trim();
       i++; continue;
     }
-    // Single-quoted string
+    // Quoted string
     const mSQ = line.match(/^(\w+)\s*=\s*"(.*)"$/);
     if (mSQ) { result[mSQ[1]] = mSQ[2]; i++; continue; }
     // Boolean / number / array
@@ -153,25 +162,8 @@ function parseSimpleTOML(src) {
   return result;
 }
 
-// Locate the Codex CLI binary.
-// Resolution order: CODEX_EXE (or legacy CODX_EXE) env → .studio/machine.json.codexExe → platform-specific install dir → PATH lookup.
-function findCodex() {
-  if (process.env.CODEX_EXE || process.env.CODX_EXE) return process.env.CODEX_EXE || process.env.CODX_EXE; // CODX_EXE: legacy spelling
-  try { const c = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); if (c.codexExe) return c.codexExe; } catch {}
-  if (process.platform === 'win32') {
-    const wins = [path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Codex', 'codex.cmd')];
-    for (const p of wins) { if (fs.existsSync(p)) return p; }
-  } else {
-    const d = path.join(process.env.HOME || '', '.local', 'bin', 'codex');
-    if (fs.existsSync(d)) return d;
-  }
-  // Fall back: PATH lookup (Windows npm installs are codex.cmd, which spawnSync cannot resolve by bare name).
-  const exts = process.platform === 'win32' ? ['.exe', '.cmd', '.bat'] : [''];
-  for (const dir of (process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean)) {
-    for (const x of exts) { const p = path.join(dir, 'codex' + x); if (fs.existsSync(p)) return p; }
-  }
-  return null; // not installed: the codex tier is skipped
-}
+// Locate the Codex CLI binary (shared with the bench: engine/codex-path.js).
+const findCodex = () => codexPath.findCodex(REPO);
 
 // Load the developer_instructions from HQ .codex/agents/<name>.toml.
 function loadCodexAgent(name) {
@@ -211,6 +203,13 @@ function parseCodexOutput(r) {
   return { turns, result: result.slice(0, 2000), error, usage: sawUsage ? usage : null, limited, missing };
 }
 
+// Limited cache: after a limit error, later stages skip Codex for an hour (the CLI gives no reliable reset time).
+const CODEX_LIMIT_FILE = path.join(REPO, '.studio', 'codex-limited.json');
+const CODEX_LIMIT_MS = 60 * 60 * 1000;
+function codexLimitedUntil() {
+  try { const u = Number(JSON.parse(fs.readFileSync(CODEX_LIMIT_FILE, 'utf8')).until); return u > Date.now() ? u : 0; } catch { return 0; }
+}
+
 // Run a stage via the Codex CLI (ADR 0004): `codex exec --json`, non-interactive, workspace-write sandbox,
 // cwd = stage workdir, prompt = HQ .codex/agents/<role>.toml instructions + the stage task (via stdin).
 // Returns { tier, model, secs, cloud, result, error, usage, turns, limited?, skipped? }.
@@ -221,32 +220,27 @@ function runCodex(stage, vars, feedback, reworkNote) {
   if (stage.expect?.length) prompt += '\n\nYou MUST create/update these files: ' + stage.expect.map((e) => fill(e, vars)).join(', ') + '.';
   if (reworkNote) prompt += '\n\n' + reworkNote;
   if (feedback) prompt += '\n\nPrevious attempt failed these checks; fix them:\n' + feedback;
+  // While Codex is rate/usage limited, go straight to the next tier without spawning (ADR 0004).
+  const lim = codexLimitedUntil();
+  if (lim) return { tier: 'codex', model: 'codex', secs: 0, cloud: true, result: '', error: 'codex limited until ' + new Date(lim).toISOString(), usage: null, turns: 0, limited: true, cached: true };
   const cwd = workdir(vars);
-  const args = ['exec', '--json', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-'];
+  // Working outside HQ: HQ docs (QA reports, reviews, sprint log) must stay writable, and the model needs the studio rules.
+  if (cwd !== REPO) prompt += studioRules(stage, cwd);
+  const args = ['exec', '--json', '--sandbox', 'workspace-write', '--skip-git-repo-check'];
+  if (cwd !== REPO) args.push('--add-dir', REPO);
+  args.push('-');
   const t0 = Date.now();
   const exe = findCodex();
-  // Resolve .cmd/.bat npm shims to the actual module so we can spawn node directly
-  // (no shell) — avoids orphaned grandchildren when spawnSync times out.
-  let resolved = exe;
-  if (exe && /\.(cmd|bat)$/i.test(exe)) {
-    const npmPrefix = path.dirname(path.dirname(process.execPath));
-    const modBin = path.join(npmPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
-    if (fs.existsSync(modBin)) resolved = modBin;
-  }
-  // When resolved === exe (.cmd file), need shell:true on Windows so cmd.exe handles the batch script.
-  // When resolved !== exe (npm module found), spawn node directly — no shell, no orphan risk.
-  const needShell = resolved === exe && /\.(cmd|bat)$/i.test(exe);
-  const r = exe
-    ? (resolved !== exe
-      ? spawnSync(process.execPath, [resolved, ...args], { cwd, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 })
-      : spawnSync(exe, args, { cwd, shell: needShell, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 }))
+  const spec = exe ? codexPath.codexSpawnSpec(exe, args) : null;
+  const r = spec
+    ? spawnSync(spec.command, spec.args, { cwd, shell: spec.shell, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 })
     : { status: null, error: Object.assign(new Error('codex not found'), { code: 'ENOENT' }), stdout: '', stderr: '' };
   const p = parseCodexOutput(r);
   const base = { tier: 'codex', model: 'codex', secs: Math.round((Date.now() - t0) / 1000), cloud: true };
   if (p.missing) {
-    ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'warning', message: `${stage.id}: codex unavailable, skipping tier` });
     return { ...base, result: '', error: 'codex binary not found', usage: null, turns: 0, skipped: true };
   }
+  if (p.limited) { try { fs.writeFileSync(CODEX_LIMIT_FILE, JSON.stringify({ until: Date.now() + CODEX_LIMIT_MS, at: now() })); } catch {} }
   return { ...base, result: p.result, error: p.error, usage: p.usage, turns: p.turns, ...(p.limited ? { limited: true } : {}) };
 }
 
@@ -303,8 +297,7 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
   });
   let prompt = fill(stage.task, vars);
   const cwd = workdir(vars);
-  const logCmd = cwd === REPO ? 'node .studio/studio.js' : `node "${STUDIO}"`;
-  prompt += `\n\nStudio rules: work only inside this repository (${cwd}). Org docs, specs and backlogs live in ${REPO} (read-only unless the task says to write there). Report progress with \`${logCmd} log ${stage.agent} <pct> "<msg>"\`.`;
+  prompt += studioRules(stage, cwd);
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files: ${stage.expect.map((e) => fill(e, vars)).join(', ')}.`;
   if (reworkNote) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
@@ -569,7 +562,7 @@ function advance(run) {
       // Codex rate/usage limit or missing binary: skip the tier (not a failure) and fall through (ADR 0004).
       if (res.limited || res.skipped) {
         const why = res.skipped ? 'unavailable' : 'limited';
-        if (res.limited) ev({ type: 'usage', agent: stage.agent, tier: tierName, provider: providerOf(tierName), model: res.model, cloud: res.cloud, tokensIn: 0, tokensOut: 0, secs: res.secs, limited: true });
+        if (res.limited && !res.cached) ev({ type: 'usage', agent: stage.agent, tier: tierName, provider: providerOf(tierName), model: res.model, cloud: res.cloud, tokensIn: 0, tokensOut: 0, secs: res.secs, limited: true });
         ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'warning', message: `${stage.id}: ${tierName} ${why}, skipping tier` });
         console.log(`  skip: ${tierName} ${why}`);
         continue;

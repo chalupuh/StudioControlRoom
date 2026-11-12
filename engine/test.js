@@ -15,6 +15,8 @@ const SUITES = [
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-codex.js',        label: 'codex tier (fake codex on PATH)' },
   { file: '../bench/bench-providers.test.js', label: 'bench provider routing' },
+  { file: '../tools/sync-codex-agents.test.js', label: 'sync-codex-agents / check-config' },
+  { file: '../studio/usage.test.js', label: 'usage reducer (provider split)' },
 ];
 
 let anyFailed = false;

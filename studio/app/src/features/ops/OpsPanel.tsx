@@ -358,7 +358,7 @@ function Budget() {
         <h3 className="sub">Top agents by tokens</h3>
         {agents.length === 0 ? <p className="ops-muted">No agent usage recorded.</p> : (
           <div className="tbl"><table>
-            <thead><tr><th scope="col">Agent</th><th scope="col" className="num">Cloud (Claude)</th><th scope="col" className="num">Local (this PC)</th><th scope="col" className="num">Calls</th></tr></thead>
+            <thead><tr><th scope="col">Agent</th><th scope="col" className="num">Cloud</th><th scope="col" className="num">Local (this PC)</th><th scope="col" className="num">Calls</th></tr></thead>
             <tbody>{agents.map((a) => (
               <tr key={a.id}><th scope="row">{a.id}</th><td className="num">{fmtTokens(a.cloudTokens)}</td><td className="num">{fmtTokens(a.localTokens)}</td><td className="num">{a.calls}</td></tr>
             ))}</tbody>
