@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { fmtDuration, fmtTokens, isCloudTier, budgetLevel, isEscalation, needsOwner } from './format';
+import { fmtDuration, fmtTokens, isCloudTier, budgetLevel, isEscalation, needsOwner, providerRows } from './format';
 import type { RunSummary } from '../../api';
 
 describe('fmtDuration', () => {
@@ -54,10 +54,25 @@ describe('fmtTokens', () => {
   });
 });
 
+describe('providerRows', () => {
+  it('returns no rows for missing or empty data', () => {
+    expect(providerRows(undefined)).toEqual([]);
+    expect(providerRows({})).toEqual([]);
+  });
+
+  it('orders providers ollama, anthropic, openai and adds labels', () => {
+    const u = { runs: 1, tokens: 10, attempts: 2, limited: 1 };
+    const rows = providerRows({ openai: u, ollama: u });
+    expect(rows.map((r) => r.id)).toEqual(['ollama', 'openai']);
+    expect(rows[1]).toEqual({ id: 'openai', label: 'OpenAI (Codex)', ...u });
+  });
+});
+
 describe('isCloudTier', () => {
-  it('returns true for opus and sonnet', () => {
+  it('returns true for opus, sonnet, and codex', () => {
     expect(isCloudTier('opus')).toBe(true);
     expect(isCloudTier('sonnet')).toBe(true);
+    expect(isCloudTier('codex')).toBe(true);
   });
 
   it('returns false for local tiers', () => {
