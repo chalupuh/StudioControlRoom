@@ -12,6 +12,7 @@ const SUITES = [
   { file: 'selftest-foreach.js',      label: 'foreach expansion (Windows paths)' },
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
+  { file: 'selftest-rework-baseline.js', label: 'rework baseline, QA manifest gate, sprint-rework routing, limit errors' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
   { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
   { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
