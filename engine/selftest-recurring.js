@@ -10,6 +10,7 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-recurring-'));
 process.env.STUDIO_HOME = HOME;
 process.env.STUDIO_LIMIT_MAX_WAITS = '3';
 const engine = require('./engine.js');
+engine.hooks.localReady = () => true; // no real Ollama check in tests
 
 let fails = 0;
 const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) fails++; };
