@@ -49,6 +49,7 @@ const LADDER = {
   sonnet:       ['sonnet', 'opus'],
   opus:         ['opus'],
 };
+const qaSkipsCodex = (stage, platform = process.platform) => platform === 'win32' && stage.agent === 'qa-engineer';
 
 const now = () => new Date().toISOString();
 const ev = (obj) => { try { fs.appendFileSync(path.join(REPO, '.studio', 'events.jsonl'), JSON.stringify({ ts: Date.now(), ...obj }) + '\n'); } catch {} };
@@ -997,7 +998,9 @@ function advance(run) {
     }
     // Ladder attempts are counted per advance() call: `resume` starts the ladder afresh (a human decided to retry),
     // so a stage blocked on every tier gets at most one full ladder per resume, never more within a single call.
-    const ladder = LADDER[stage.tier || 'local'];
+    // Codex's Windows sandbox can't spawn child processes (spawn EPERM), so it can never run tests:
+    // QA stages skip the codex tier on win32 and fall through to Sonnet (lane K routing: QA prefers sonnet).
+    const ladder = qaSkipsCodex(stage) ? LADDER[stage.tier || 'local'].filter((t) => t !== 'codex') : LADDER[stage.tier || 'local'];
     let feedback = null, done = false, reworked = false;
     const cwd = workdir(vars);
     // A rework record is addressed to this stage when it is the rework target (builder side).
