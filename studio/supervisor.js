@@ -270,9 +270,13 @@ function tick(ctx, deps = {}) {
     const cursor = run.cursor || 0;
     // A failed process scan (null) cannot tell a live resumed engine from a dead one: settle only after takeLock succeeds.
     const scanOk = !!studioProcs;
+    let lockTaken = false;
     if (scanOk) settleResumes(lock);
+    else if (takeLock(lock, deps)) { lockTaken = true; settleResumes(lock); }
+    else { log(`run ${id}: locked by a live process, skipping`); result.skipped.push(id); continue; }
     const guard = crashLoopGuard(lock, cursor);
     if (guard.blocked) {
+      if (lockTaken) { try { fs.unlinkSync(lock); } catch {} }
       log(`run ${id}: crash-loop blocked (${guard.reason})`);
       result.skipped.push(id);
       try {
@@ -284,8 +288,7 @@ function tick(ctx, deps = {}) {
       continue;
     }
 
-    if (!takeLock(lock, deps)) { log(`run ${id}: locked by a live process, skipping`); result.skipped.push(id); continue; }
-    if (!scanOk) settleResumes(lock);
+    if (!lockTaken && !takeLock(lock, deps)) { log(`run ${id}: locked by a live process, skipping`); result.skipped.push(id); continue; }
     try {
       const r = deps.spawnEngine(HOME, id, ctx);
       const pid = pidOf(r);
