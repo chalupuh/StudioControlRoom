@@ -22,12 +22,9 @@ const codexPath = require('./codex-path.js');
 
 // REPO = the org workspace (STUDIO_HOME): agents, docs, pipelines, runtime data. The engine itself may live
 // elsewhere (StudioControlRoom). Resolution: STUDIO_HOME env → studio.home.json at the software root → legacy.
-function studioHome() {
-  if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
-  try { const c = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'studio.home.json'), 'utf8')); if (c.home) return path.resolve(c.home); } catch {}
-  return path.resolve(__dirname, '..', '..');
-}
-const REPO = studioHome();
+const machineLib = require('../studio/machine');
+const REPO = machineLib.studioHome(path.resolve(__dirname, '..', '..')); // legacy fallback: engine inside HOME/tools/engine
+const MACHINE = machineLib.load(REPO); // per-machine profile (REPO/.studio/machine.json)
 const PIPES = path.join(REPO, 'tools', 'engine', 'pipelines');
 const RUNS = path.join(REPO, '.studio', 'runs');
 const STUDIO = [path.join(__dirname, '..', 'studio', 'studio.js'), path.join(REPO, '.studio', 'studio.js')].find((p) => fs.existsSync(p));
@@ -54,15 +51,15 @@ const LADDER = {
 
 const now = () => new Date().toISOString();
 const ev = (obj) => { try { fs.appendFileSync(path.join(REPO, '.studio', 'events.jsonl'), JSON.stringify({ ts: Date.now(), ...obj }) + '\n'); } catch {} };
-const TEAM_FALLBACK = { 'rd-manager': 'rd', 'market-researcher': 'rd', 'opportunity-analyst': 'rd', 'creative-director': 'creative', 'image-artist': 'creative', 'video-producer': 'creative', 'copy-voice': 'creative', 'ui-ux-designer': 'creative' };
+const { teamOf } = require('../studio/teams');
 // Paused if the global switch is paused, or (when agentId is given) that agent's team is paused.
 const paused = (agentId) => { try {
   const c = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'control.json'), 'utf8'));
   if (c.state === 'paused') return true;
   if (!agentId || !c.teams) return false;
-  let team = TEAM_FALLBACK[agentId] || 'eng';
-  try { team = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'roster.json'), 'utf8')).agents[agentId].team || team; } catch {}
-  return c.teams[team] === 'paused';
+  let roster = null;
+  try { roster = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'roster.json'), 'utf8')); } catch {}
+  return c.teams[teamOf(agentId, roster)] === 'paused';
 } catch { return false; } };
 
 function claudeExe() {
@@ -364,7 +361,7 @@ function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
     return runCodex(stage, vars, feedback, reworkNote);
   }
   const env = { ...process.env };
-  const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
+  const machineCfg = MACHINE; // merged per-machine profile (machine.json over defaults)
   // Headless Claude Code on Windows needs Git Bash for its Bash tool; without this, agents have
   // no shell (can't run builds/tests) — found 2026-11-07 when QA couldn't run `npm run build`.
   // Resolution order: env STUDIO_GIT_BASH → .studio/machine.json gitBash → system default.
@@ -551,12 +548,11 @@ function ollamaUp(url) {
   return r.status === 0;
 }
 function ensureLocalServer(agentId) {
-  let cfg = {}; try { cfg = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch {}
-  const url = (cfg.ollama && cfg.ollama.url) || 'http://127.0.0.1:11434';
+  const url = machineLib.ollamaUrl(MACHINE);
   if (ollamaUp(url)) return true;
   console.log(`  ⚠ local model server ${url} is not answering; starting it and waiting up to ${Math.round(OLLAMA_WAIT_MS / 60000)} min`);
   ev({ type: 'progress', agent: agentId, pct: 0, status: 'waiting', message: `local model server down; starting Ollama` });
-  try { require('child_process').spawn((cfg.ollama && cfg.ollama.exe) || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
+  try { require('child_process').spawn(MACHINE.ollama.exe || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
   const cell = new Int32Array(new SharedArrayBuffer(4));
   for (let left = OLLAMA_WAIT_MS; left > 0 && !paused(agentId); left -= 5000) {
     Atomics.wait(cell, 0, 0, 5000);

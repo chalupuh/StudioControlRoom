@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // ComfyUI helper (Node 24, no deps). See README.md.
 const fs = require('fs'), path = require('path');
-const BASE = process.env.COMFY_URL || 'http://127.0.0.1:8188';
+const BASE = process.env.COMFY_URL || require('../studio/machine').load().comfyUrl;
 const [cmd, ...rest] = process.argv.slice(2);
 const a = {};
 for (let i = 0; i < rest.length; i++) if (rest[i].startsWith('--')) a[rest[i].slice(2)] = rest[i + 1]?.startsWith('--') || rest[i + 1] === undefined ? true : rest[++i];
