@@ -625,7 +625,7 @@ function advance(run) {
         continue;
       }
       if (['sonnet', 'opus'].includes(tierName)) writePostmortem(run, stage);
-      ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
+      ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]`, tier: tierName, model: TIERS[tierName].model, cloud: !TIERS[tierName].local });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
       const t0 = Date.now();
