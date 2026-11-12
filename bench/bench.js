@@ -36,7 +36,7 @@ async function chatOllama(model, messages, tools) {
       if (j.error) throw new Error('ollama: ' + j.error);
       const secs = (Date.now() - t0) / 1000;
       const tps = j.eval_count && j.eval_duration ? j.eval_count / (j.eval_duration / 1e9) : 0;
-      return { msg: j.message, secs, tps, outTokens: j.eval_count || 0 };
+      return { msg: j.message, secs, tps, outTokens: j.eval_count || 0, inTokens: j.prompt_eval_count || 0 };
     } catch (e) {
       if (attempt < 2 && /fetch failed|ECONNREFUSED|reset|abort/i.test(String(e))) {
         await new Promise((r) => setTimeout(r, 3000)); // Ollama may be loading model
@@ -47,45 +47,69 @@ async function chatOllama(model, messages, tools) {
   }
 }
 
-// codex CLI provider (ADR 0004): `codex exec --json --sandbox workspace-write -`
-function findCodex() {
-  if (process.env.CODX_EXE) return process.env.CODX_EXE;
+// Shared CLI helpers. Both CLI providers run in a throwaway temp dir so a model can never touch the repo.
+const findCodex = () => require('../engine/engine.js').findCodex(); // same resolution as the engine (CODEX_EXE, machine.json, PATH)
+
+function findClaude() {
+  if (process.env.CLAUDE_EXE) return process.env.CLAUDE_EXE;
   const wins = process.platform === 'win32';
-  const searchPaths = [];
-  if (wins) {
-    searchPaths.push(path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Codex', 'codex.cmd'));
-  }
   for (const dir of (process.env.PATH || process.env.Path || '').split(path.delimiter).filter(Boolean)) {
-    const exts = wins ? ['.exe', '.cmd', '.bat'] : [''];
-    for (const x of exts) { const p = path.join(dir, 'codex' + x); if (fs.existsSync(p)) searchPaths.push(p); }
+    for (const x of wins ? ['.exe', '.cmd'] : ['']) { const p = path.join(dir, 'claude' + x); if (fs.existsSync(p)) return p; }
   }
-  return searchPaths.find((p) => fs.existsSync(p)) || null;
+  const found = [];
+  const walk = (d, depth) => { if (depth > 5) return; let es = []; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of es) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p, depth + 1); else if (e.name === 'claude.exe') found.push(p); } };
+  walk(path.join(process.env.LOCALAPPDATA || '', 'Claude-Data'), 0);
+  found.sort((x, y) => fs.statSync(x).mtimeMs - fs.statSync(y).mtimeMs);
+  return found.pop() || null;
 }
 
+// One prompt for every provider: system message (if any) first, then the first user message.
+const flatPrompt = (messages) => {
+  const sys = (messages.find((m) => m.role === 'system') || {}).content;
+  const usr = (messages.find((m) => m.role === 'user') || {}).content || '';
+  return sys ? sys + '\n\n' + usr : usr;
+};
+
+function spawnCli(exe, args, input) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-cli-'));
+  const shell = /\.(cmd|bat)$/i.test(exe); // npm shims need a shell on Windows; real binaries do not
+  const t0 = Date.now();
+  try {
+    const r = spawnSync(shell ? `"${exe}"` : exe, args, { input, cwd: dir, shell, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
+    return { r, secs: (Date.now() - t0) / 1000 };
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+// codex CLI provider (ADR 0004, ChatGPT sign-in, no API key): `codex exec --json --sandbox read-only -`
 async function chatCodex(_model, messages, _tools) {
   const exe = findCodex();
   if (!exe) throw new Error('codex binary not found on PATH');
-  const prompt = (messages.find((m) => m.role === 'user') || {}).content || '';
-  const args = ['exec', '--json', '--sandbox', 'workspace-write', '-'];
-  const shell = /\.(cmd|bat)$/i.test(exe);
-  const t0 = Date.now();
-  const r = spawnSync(shell ? `"${exe}"` : exe, args, { input: prompt, shell: true, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
-  const secs = (Date.now() - t0) / 1000;
-  let result = '', outTokens = 0, error = null;
+  const { r, secs } = spawnCli(exe, ['exec', '--json', '--sandbox', 'read-only', '--skip-git-repo-check', '-'], flatPrompt(messages));
+  let result = '', outTokens = 0, inTokens = 0, error = null;
   for (const line of (r.stdout || '').split('\n')) {
     let o; try { o = JSON.parse(line.trim()); } catch { continue; }
     if (!o || typeof o !== 'object') continue;
     if (o.type === 'item.completed' && o.item && o.item.type === 'agent_message') result = String(o.item.text || '');
     else if (o.type === 'result') result = String(o.result || '');
-    else if (o.type === 'turn.completed' && o.usage) outTokens += (o.usage.output_tokens || 0);
+    else if (o.type === 'turn.completed' && o.usage) { outTokens += (o.usage.output_tokens || 0); inTokens += (o.usage.input_tokens || 0); }
     else if (o.type === 'turn.failed' || o.type === 'error') error = o.error?.message || o.message;
   }
-  if (!result && r.status !== 0) {
-    const msg = error || r.stderr?.slice(-800) || 'codex exited with code ' + r.status;
-    throw new Error('codex: ' + msg);
-  }
-  const tps = secs > 0 ? outTokens / secs : 0;
-  return { msg: { content: result }, secs, tps, outTokens };
+  if (!result && r.status !== 0) throw new Error('codex: ' + (error || r.stderr?.slice(-800) || 'exited with code ' + r.status));
+  return { msg: { content: result }, secs, tps: secs > 0 ? outTokens / secs : 0, outTokens, inTokens };
+}
+
+// Sonnet via Claude Code (`claude -p --model sonnet --output-format json`): the studio has no API key.
+async function chatClaude(model, messages, _tools) {
+  const exe = findClaude();
+  if (!exe) throw new Error('claude binary not found (set CLAUDE_EXE)');
+  const { r, secs } = spawnCli(exe, ['-p', '--model', model, '--output-format', 'json'], flatPrompt(messages));
+  let j = null; try { j = JSON.parse((r.stdout || '').trim()); } catch {}
+  if (!j || j.is_error || r.status !== 0) throw new Error('claude: ' + ((j && j.result) || r.stderr?.slice(-800) || 'exited with code ' + r.status));
+  const u = j.usage || {};
+  const outTokens = u.output_tokens || 0;
+  const inTokens = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.cache_read_input_tokens || 0);
+  return { msg: { content: String(j.result || '') }, secs, tps: secs > 0 ? outTokens / secs : 0, outTokens, inTokens };
 }
 
 // Anthropic Messages API provider
@@ -122,7 +146,7 @@ async function chatAnthropic(model, messages, _tools) {
       const secs = (Date.now() - t0) / 1000;
       const outTokens = j.usage?.output_tokens || 0;
       const tps = secs > 0 ? outTokens / secs : 0;
-      return { msg: { content: j.content?.[0]?.text || '' }, secs, tps, outTokens };
+      return { msg: { content: j.content?.[0]?.text || '' }, secs, tps, outTokens, inTokens: j.usage?.input_tokens || 0 };
     } catch (e) {
       if (attempt < 2 && /fetch failed|ECONNREFUSED|reset|abort/i.test(String(e))) {
         await new Promise((r) => setTimeout(r, 3000)); continue;
@@ -135,7 +159,8 @@ async function chatAnthropic(model, messages, _tools) {
 // Provider registry: maps provider name → { displayName, model, chatFn }
 const PROVIDERS = {
   codex:       { displayName: 'Codex',       model: 'codex',              chatFn: chatCodex },
-  sonnet:      { displayName: 'Sonnet',      model: 'claude-sonnet-4-20250514', chatFn: chatAnthropic },
+  sonnet:      { displayName: 'Sonnet',      model: process.env.BENCH_SONNET_MODEL || 'sonnet', chatFn: chatClaude },
+  'sonnet-api': { displayName: 'Sonnet (API)', model: process.env.BENCH_SONNET_MODEL || 'claude-sonnet-4-20250514', chatFn: chatAnthropic },
   'qwen3.6:27b': { displayName: 'Qwen3.6 27B', model: 'qwen3.6:27b',       chatFn: chatOllama },
   'qwen3-coder:30b': { displayName: 'Qwen3-Coder 30B', model: 'qwen3-coder:30b', chatFn: chatOllama },
   'qwen3:4b':  { displayName: 'Qwen3 4B',    model: 'qwen3:4b',           chatFn: chatOllama },
@@ -201,10 +226,10 @@ async function runTask(provider, task) {
   const messages = [];
   if (task.system) messages.push({ role: 'system', content: task.system });
   messages.push({ role: 'user', content: task.prompt });
-  let total = { secs: 0, outTokens: 0, tps: [] }, out = '', calls = [];
+  let total = { secs: 0, outTokens: 0, inTokens: 0, tps: [] }, out = '', calls = [];
   for (let step = 0; step < (task.tools ? 6 : 1); step++) {
     const r = await provider.chatFn(provider.model, messages, task.tools);
-    total.secs += r.secs; total.outTokens += r.outTokens; if (r.tps) total.tps.push(r.tps);
+    total.secs += r.secs; total.outTokens += r.outTokens; total.inTokens += r.inTokens || 0; if (r.tps) total.tps.push(r.tps);
     messages.push(r.msg);
     out = r.msg.content || out;
     const tc = r.msg.tool_calls || [];
@@ -216,7 +241,7 @@ async function runTask(provider, task) {
       messages.push({ role: 'tool', content: r2 });
     }
   }
-  return { out, calls, secs: total.secs, outTokens: total.outTokens, tps: total.tps.length ? total.tps.reduce((a, b) => a + b) / total.tps.length : 0 };
+  return { out, calls, secs: total.secs, outTokens: total.outTokens, inTokens: total.inTokens, tps: total.tps.length ? total.tps.reduce((a, b) => a + b) / total.tps.length : 0 };
 }
 
 // ---------- main runner ----------
@@ -253,14 +278,14 @@ async function run() {
           res = await runTask(provider, task);
           chk = check(task, res.out, res.calls);
         } catch (e) {
-          res = { out: 'ERROR: ' + e.message, calls: [], secs: 0, tps: 0, outTokens: 0 };
+          res = { out: 'ERROR: ' + e.message, calls: [], secs: 0, tps: 0, outTokens: 0, inTokens: 0 };
           chk = { auto: 0, notes: e.message };
         }
         console.log(`${chk.auto === null ? 'judge' : chk.auto ? 'PASS' : 'FAIL'} (${res.secs.toFixed(1)}s, ${res.tps.toFixed(0)} tok/s)`);
-        const row = { model: modelLabel, provider: provider.model, role, id: task.id, auto: chk.auto, secs: +res.secs.toFixed(1), tps: +res.tps.toFixed(0), outTokens: res.outTokens, rubric: task.rubric || null };
+        const row = { model: modelLabel, provider: provider.model, role, id: task.id, auto: chk.auto, secs: +res.secs.toFixed(1), tps: +res.tps.toFixed(0), outTokens: res.outTokens, inTokens: res.inTokens, rubric: task.rubric || null };
         rows.push(row);
         const safeModel = modelLabel.replace(/[:/\s]/g, '_');
-        const md = `# ${role}/${task.id} · ${modelLabel}\n\n**Auto check:** ${chk.auto === null ? 'n/a' : chk.auto ? 'PASS' : 'FAIL'}  \n**Time:** ${row.secs}s · ${row.tps} tok/s · ${row.outTokens} tokens\n\n## Check notes\n\`\`\`\n${chk.notes}\n\`\`\`\n\n## Rubric (for judge)\n${(task.rubric || []).map((r) => '- ' + r).join('\n') || '(none)'}\n\n## Prompt\n${task.prompt}\n\n## Tool calls\n${res.calls.map((c) => '- ' + c.function?.name + ' ' + JSON.stringify(c.function?.arguments)).join('\n') || '(none)'}\n\n## Output\n${res.out}\n`;
+        const md = `# ${role}/${task.id} · ${modelLabel}\n\n**Auto check:** ${chk.auto === null ? 'n/a' : chk.auto ? 'PASS' : 'FAIL'}  \n**Time:** ${row.secs}s · ${row.tps} tok/s · ${row.inTokens} in / ${row.outTokens} out tokens\n\n## Check notes\n\`\`\`\n${chk.notes}\n\`\`\`\n\n## Rubric (for judge)\n${(task.rubric || []).map((r) => '- ' + r).join('\n') || '(none)'}\n\n## Prompt\n${task.prompt}\n\n## Tool calls\n${res.calls.map((c) => '- ' + c.function?.name + ' ' + JSON.stringify(c.function?.arguments)).join('\n') || '(none)'}\n\n## Output\n${res.out}\n`;
         fs.writeFileSync(path.join(outDir, `${safeModel}__${role}__${task.id}.md`), md);
       }
     }
@@ -288,4 +313,4 @@ if (cmd === 'run') run().catch((e) => { console.error(e); process.exit(1); });
 else if (cmd === 'report') console.log(report(JSON.parse(fs.readFileSync(path.join(process.argv[3], 'results.json'), 'utf8'))));
 else console.log('usage: bench.js run [--models a,b] [--providers p1,p2] [--roles r1,r2] | report <dir>');
 
-module.exports = { run, runTask, check, PROVIDERS, chatOllama, chatCodex, chatAnthropic, findCodex };
+module.exports = { run, runTask, check, PROVIDERS, chatOllama, chatCodex, chatClaude, chatAnthropic, findCodex, findClaude };
