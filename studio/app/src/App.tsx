@@ -10,6 +10,9 @@ import { OrgView } from './features/org/OrgView';
 import { OpsPanel } from './features/ops/OpsPanel';
 import { VillageView } from './features/village/VillageView';
 
+// Village tab archived by the owner (2026-11-11). Code and tests stay in features/village; set true to bring it back.
+const SHOW_VILLAGE = false;
+
 export default function App() {
   const studio = useStudio();
   const { state, online } = studio;
@@ -36,7 +39,7 @@ export default function App() {
         <span className={'live ' + (online ? 'on' : 'off')}><i />{online ? 'live' : 'offline'}</span>
         <nav className="tabs" role="tablist">
           <button role="tab" aria-selected={tab === 'org'} onClick={() => setTab('org')}>Team</button>
-          <button role="tab" aria-selected={tab === 'village'} onClick={() => setTab('village')}>Village</button>
+          {SHOW_VILLAGE && <button role="tab" aria-selected={tab === 'village'} onClick={() => setTab('village')}>Village</button>}
           <button role="tab" aria-selected={tab === 'ops'} onClick={() => setTab('ops')}>
             Operations {waiting > 0 && <b className="badge">{waiting}</b>}
           </button>
@@ -51,7 +54,7 @@ export default function App() {
       <main>
         {!state ? <div className="loading">Connecting to studio…</div>
           : tab === 'org' ? <OrgView studio={studio} />
-            : tab === 'village' ? <VillageView studio={studio} />
+            : SHOW_VILLAGE && tab === 'village' ? <VillageView studio={studio} />
             : <OpsPanel studio={studio} />}
       </main>
     </div>

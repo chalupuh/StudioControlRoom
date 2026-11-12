@@ -54,7 +54,9 @@ async function run() {
         }
       }
       walk(tmpExtract);
-      check('backup zip contains runs/test-run.json', files.some((f) => /runs[/\\]test-run\.json$/.test(f)));
+      const norm = files.map((f) => f.split(path.sep).join('/'));
+      check('backup zip has exact entry .studio/runs/test-run.json', norm.includes('.studio/runs/test-run.json'));
+      check('backup zip has exact entry docs/internal/qa.md', norm.includes('docs/internal/qa.md'));
     } catch (e) {
       check('backup zip expansion (skipped: ' + e.message + ')', false);
     } finally {
@@ -90,7 +92,7 @@ async function run() {
           }
         }
         walk2(tmpExtract2);
-        check('B2: zip contains runs/live-run.log', files2.some((f) => /runs[/\\]live-run\.log$/.test(f)));
+        check('B2: zip contains .studio/runs/live-run.log', files2.map((f) => f.split(path.sep).join('/')).includes('.studio/runs/live-run.log'));
       } finally {
         fs.rmSync(tmpExtract2, { recursive: true, force: true });
       }
@@ -115,6 +117,48 @@ async function run() {
   check('pruneOld: keeps 14', after.length === 14);
   check('pruneOld: keeps newest fake', after.includes('2026-01-14.zip'));
   check('pruneOld: drops oldest', !after.includes('2026-01-01.zip'));
+
+  // --- Injected zipper / copier (OS independent) ---
+  const stagingLeft = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('studio-backup-')).sort().join();
+  const listFiles = (dir, base = dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? listFiles(path.join(dir, e.name), base) : [path.relative(base, path.join(dir, e.name)).split(path.sep).join('/')]);
+  {
+    const h2 = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-inj-'));
+    fs.cpSync(HOME, h2, { recursive: true });
+    fs.rmSync(path.join(h2, '.studio', 'backups'), { recursive: true, force: true });
+    const before = stagingLeft();
+
+    // exact staged layout
+    let entries = [];
+    const okZip = async (src, destZip) => { entries = listFiles(src[0]); fs.writeFileSync(destZip, 'zipbytes'); };
+    const d1 = await backup.backup({ HOME: h2, now: new Date(2026, 4, 1, 3, 0), zip: okZip });
+    check('staged layout has .studio/runs/test-run.json and docs/internal/qa.md', entries.includes('.studio/runs/test-run.json') && entries.includes('docs/internal/qa.md') && entries.includes('.studio/roster.json'));
+    check('complete backup has no MISSING.txt', !entries.includes('MISSING.txt') && d1 && fs.existsSync(d1));
+    check('no .partial left after success', !fs.readdirSync(path.join(h2, '.studio', 'backups')).some((f) => f.endsWith('.partial')));
+
+    // zip fails after writing bytes: no .partial, no <date>.zip, no staging dir left
+    const badZip = async (src, destZip) => { fs.writeFileSync(destZip, 'half'); throw new Error('zip exploded'); };
+    let threw = false;
+    try { await backup.backup({ HOME: h2, now: new Date(2026, 4, 2, 3, 0), zip: badZip }); } catch { threw = true; }
+    const bdir = path.join(h2, '.studio', 'backups');
+    check('failed zip rejects', threw);
+    check('failed zip leaves no .partial and no <date>.zip', !fs.existsSync(path.join(bdir, '2026-05-02.zip.partial')) && !fs.existsSync(path.join(bdir, '2026-05-02.zip')));
+    check('failed zip leaves no studio-backup-* staging dir', stagingLeft() === before);
+
+    // copy failure: runs/ cannot be copied -> retried, reported in MISSING.txt and the log, backup still produced
+    const logs = [];
+    let attempts = 0;
+    const flakyCp = (src, dst) => { if (/runs/.test(src)) { attempts++; throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' }); } fs.cpSync(src, dst, { recursive: true }); };
+    let miss = '';
+    const capZip = async (src, destZip) => { entries = listFiles(src[0]); try { miss = fs.readFileSync(path.join(src[0], 'MISSING.txt'), 'utf8'); } catch {} fs.writeFileSync(destZip, 'zipbytes'); };
+    const d3 = await backup.backup({ HOME: h2, now: new Date(2026, 4, 3, 3, 0), zip: capZip, cp: flakyCp, log: (m) => logs.push(m) });
+    check('copy failure: item retried before giving up', attempts >= 2);
+    check('copy failure: MISSING.txt in the archive names the failed file', entries.includes('MISSING.txt') && /\.studio\/runs\/test-run\.json/.test(miss));
+    check('copy failure: logged as backup partial', logs.some((m) => /^backup partial: .*runs/.test(m)));
+    check('copy failure: other sources still backed up', entries.includes('docs/internal/qa.md') && d3 && fs.existsSync(d3));
+    check('copy failure: no staging dir left', stagingLeft() === before);
+    fs.rmSync(h2, { recursive: true, force: true });
+  }
 
   // --- Empty HOME: nothing to back up ---
   const emptyHOME = fs.mkdtempSync(path.join(os.tmpdir(), 'bk-empty-'));

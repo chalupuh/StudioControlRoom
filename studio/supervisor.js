@@ -8,27 +8,25 @@
 //  - Daily backup at 03:00 local time (zip of runs, checkpoints, roster, events, docs/internal).
 // Log: HOME/.studio/logs/supervisor.log (rotated at 5 MB, 5 files kept).
 //
-// S1:  Team-paused runs are skipped (not resumed).
-// S2:  Crash-loop guard blocks after 3 resumes/h with no cursor change; concurrency cap at MACHINE.gpu.llmSlots || 2.
-// S4:  engineAlive matches runId as a whole token; alive verifies PID command line.
-// S5:  spawnEngine uses cwd, appends output to run log, and has an error handler.
-// N5:  Single-instance guard via locks/supervisor.lock.
+// Liveness of a lock holder is decided by process command line (engine.js), never by a bare PID, because
+// Windows recycles PIDs: a dead engine's PID reused by any other process must not block a run forever.
+// Locks are also removed when the engine we spawned exits.
+// Crash loop: a resume counts as a crash only if that engine lived < CRASH_MS; the history is cleared whenever
+// the switch is Paused, so pause/resume cycles, Game mode and reboots never block a healthy run.
+// Resumed engines log to runs/<id>.log through an inherited file descriptor, so they survive a supervisor restart.
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { TEAMS, TEAM_FALLBACK, teamOf, teamPaused } = require('./teams');
 
 const INTERVAL_MS = 60000;
 const MAX_LOG = 5 * 1024 * 1024;
 const KEEP = 5;
+const CRASH_MS = 5 * 60 * 1000;
 const RESUMABLE = new Set(['paused', 'running']);
-const TEAMS = ['eng', 'rd', 'creative'];
-const TEAM_FALLBACK = {
-  'rd-manager': 'rd', 'market-researcher': 'rd', 'opportunity-analyst': 'rd',
-  'creative-director': 'creative', 'image-artist': 'creative',
-  'video-producer': 'creative', 'copy-voice': 'creative', 'ui-ux-designer': 'creative',
-};
+const ENGINE_RE = /engine[\\/]engine\.js/;
 
-// S4: alive checks PID and verifies command line contains 'engine.js'
+/** Bare liveness (signal 0). Only a building block: use enginePid() for engine locks. */
 const alive = (pid) => {
   if (!pid) return false;
   try {
@@ -39,11 +37,27 @@ const alive = (pid) => {
   }
 };
 
-/** S4: verify PID belongs to an engine.js process (Windows CIM query). */
-function enginePid(pid, studioProcs) {
-  if (!alive(pid)) return false;
-  if (!studioProcs) return true; // fallback when procs not available
-  return studioProcs.some((p) => p.pid === pid && /engine[\\/]engine\.js/.test(p.cmd));
+/** True when pid is alive AND is an engine.js process (per the process scan). procs === null: scan unavailable. */
+function enginePid(pid, procs, aliveFn = alive) {
+  if (!aliveFn(pid)) return false;
+  if (!procs) return true;
+  return procs.some((p) => p.pid === pid && ENGINE_RE.test(p.cmd));
+}
+
+/** Is any engine.js process running this run id (whole-token match, not substring)? */
+function engineAlive(runId, procs) {
+  if (!procs) return false;
+  const re = new RegExp('(?<![\\w.-])' + runId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w.-])');
+  return procs.some((p) => ENGINE_RE.test(p.cmd) && re.test(p.cmd));
+}
+
+/** Process scan, or null when unavailable (non-Windows): callers then fall back to bare PID checks. */
+function loadProcs(deps = {}) {
+  try {
+    if (deps.studioProcesses) return deps.studioProcesses();
+    if (process.platform !== 'win32') return null;
+    return require('./power').studioProcesses();
+  } catch { return null; }
 }
 
 function makeLogger(DIR, maxBytes = MAX_LOG, keep = KEEP) {
@@ -61,108 +75,164 @@ function makeLogger(DIR, maxBytes = MAX_LOG, keep = KEEP) {
   };
 }
 
-/** Take the per-run lock. Returns true if we now own it, false if a live process already holds it. */
+/**
+ * Take a lock file (atomic create). Returns true if we now own it, false if a live holder has it.
+ * deps.isAlive(pid) decides liveness; deps.staleMs (optional) also treats a lock not touched for that long as stale.
+ */
 function takeLock(lockFile, deps) {
   fs.mkdirSync(path.dirname(lockFile), { recursive: true });
   for (let attempt = 0; attempt < 2; attempt++) {
     try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' }); return true; } catch (e) {
       if (e.code !== 'EEXIST') throw e;
       let pid = 0; try { pid = Number(fs.readFileSync(lockFile, 'utf8')); } catch {}
-      if (deps.isAlive(pid)) return false;
+      let stale = false;
+      if (deps.staleMs) { try { stale = Date.now() - fs.statSync(lockFile).mtimeMs > deps.staleMs; } catch {} }
+      if (!stale && deps.isAlive(pid)) return false;
       try { fs.unlinkSync(lockFile); } catch {}
     }
   }
   return false;
 }
 
-/** S1: Determine the team for an agent (used for team-pause check). */
-function teamOf(agent, roster) {
-  const t = (roster && roster.agents && roster.agents[agent] || {}).team;
-  return TEAMS.includes(t) ? t : (TEAM_FALLBACK[agent] || 'eng');
+/** Delete a lock only if it still names `pid` (the engine that just exited). */
+function releaseLock(lockFile, pid) {
+  try { if (Number(fs.readFileSync(lockFile, 'utf8')) === pid) fs.unlinkSync(lockFile); } catch {}
 }
 
-/** S1: Check if a team is paused in the control state. */
-function teamPaused(team, control) {
-  return control && control.teams && control.teams[team] === 'paused';
-}
-
-/** S2: crash-loop history lives next to the lock (locks/<id>.resumes.json) so replacing a stale lock keeps it. */
-function resumesFile(lockFile) { return lockFile.replace(/.lock$/, '.resumes.json'); }
+/** Crash-loop history lives next to the lock (locks/<id>.resumes.json) so replacing a stale lock keeps it. */
+function resumesFile(lockFile) { return lockFile.replace(/\.lock$/, '.resumes.json'); }
 
 function readResumes(lockFile) {
   try { const a = JSON.parse(fs.readFileSync(resumesFile(lockFile), 'utf8')); return Array.isArray(a) ? a : []; } catch { return []; }
 }
-
-/** S2: Blocks after 3 resumes within 1 hour with no cursor change. */
-function crashLoopGuard(lockFile, runCursor, now = Date.now()) {
-  const recent = readResumes(lockFile).filter((t) => t.time > now - 60 * 60 * 1000 && t.cursor === runCursor);
-  if (recent.length < 3) return { blocked: false };
-  return { blocked: true, reason: 'supervisor: resume loop (3 resumes/1h, no cursor change)' };
+function writeResumes(lockFile, list) {
+  try { fs.writeFileSync(resumesFile(lockFile), JSON.stringify(list.slice(-10))); } catch {}
 }
 
-/** S2: Record a resume attempt (keeps the last 10). */
-function recordResume(lockFile, cursor) {
+/** Called when we know the previous engine for this run is gone: settle its lifetime (crash if < CRASH_MS). */
+function settleResumes(lockFile, now = Date.now()) {
   const list = readResumes(lockFile);
-  list.push({ time: Date.now(), cursor });
-  fs.writeFileSync(resumesFile(lockFile), JSON.stringify(list.slice(-10)));
+  const last = list[list.length - 1];
+  if (last && last.ended === undefined) {
+    last.ended = now;
+    last.crashed = now - last.time < CRASH_MS;
+    writeResumes(lockFile, list);
+  }
 }
 
-/** S5: Spawn engine with cwd, log output, and error handler. */
-function defaultSpawnEngine(HOME, runId, ctx) {
-  const engine = path.join(__dirname, '..', 'engine', 'engine.js');
-  const logFile = path.join(HOME, '.studio', 'runs', runId + '.log');
-  const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-  const child = spawn(process.execPath, [engine, 'resume', runId], {
-    cwd: HOME,
-    detached: true,
-    windowsHide: true,
-    env: { ...process.env, STUDIO_HOME: HOME },
-  });
-  child.stdout.pipe(logStream);
-  child.stderr.pipe(logStream);
-  child.on('error', (err) => {
-    const logger = ctx && ctx.log ? ctx.log : console.error;
-    logger(`engine ${runId}: spawn error: ${err.message}`);
-  });
+/** Blocks after 3 crashed resumes (engine lived < 5 min) within 1 hour at the same cursor. */
+function crashLoopGuard(lockFile, runCursor, now = Date.now()) {
+  const recent = readResumes(lockFile).filter((t) => t.crashed && t.time > now - 60 * 60 * 1000 && t.cursor === runCursor);
+  if (recent.length < 3) return { blocked: false };
+  return { blocked: true, reason: 'supervisor: resume loop (3 quick engine exits/1h, no cursor change)' };
+}
+
+/** Record a resume attempt (keeps the last 10). */
+function recordResume(lockFile, cursor, pid) {
+  const list = readResumes(lockFile);
+  list.push({ time: Date.now(), cursor, pid });
+  writeResumes(lockFile, list);
+}
+
+/** Forget all crash history (switch Paused: engines stopped on purpose, not crashed). */
+function clearResumes(DIR) {
+  const dir = path.join(DIR, 'locks');
+  let names = []; try { names = fs.readdirSync(dir); } catch {}
+  for (const n of names) if (n.endsWith('.resumes.json')) { try { fs.unlinkSync(path.join(dir, n)); } catch {} }
+}
+
+/**
+ * Spawn `engine.js <args>` detached. Used by the supervisor AND the dashboard. stdout/stderr go straight to
+ * runs/<id>.log through an inherited file descriptor (no pipe owned by this process), stdin is ignored, so the
+ * engine keeps logging and cannot get EPIPE when this process exits. Returns the child (child.stdout === null).
+ * ctx: { log?, engine? (override path) }
+ */
+function spawnEngine(HOME, runId, ctx = {}, args = ['resume', runId]) {
+  const engine = ctx.engine || path.join(__dirname, '..', 'engine', 'engine.js');
+  const runs = path.join(HOME, '.studio', 'runs');
+  fs.mkdirSync(runs, { recursive: true });
+  const out = fs.openSync(path.join(runs, runId + '.log'), 'a');
+  let child;
+  try {
+    child = spawn(process.execPath, [engine, ...args], {
+      cwd: HOME, detached: true, windowsHide: true, stdio: ['ignore', out, out],
+      env: { ...process.env, STUDIO_HOME: HOME },
+    });
+  } finally { fs.closeSync(out); }
+  child.on('error', (err) => { (ctx.log || console.error)(`engine ${runId}: spawn error: ${err.message}`); });
   child.unref();
-  return child.pid;
+  return child;
+}
+
+/** spawnEngine result -> pid (tests inject functions that return a bare pid). */
+const pidOf = (r) => (r && typeof r === 'object' ? r.pid : r);
+function watchExit(r, lock) {
+  if (r && typeof r === 'object' && typeof r.on === 'function' && r.pid) r.on('exit', () => releaseLock(lock, r.pid));
+}
+
+/**
+ * Dashboard "resume run": same lock + liveness rules as the supervisor, so two clicks (or a click on a run the
+ * supervisor already resumed) can never start two engines. Returns { code, body }.
+ * ctx: { HOME, DIR, log?, engine? }; deps (tests): spawnEngine, isAlive, studioProcesses
+ */
+function resumeRun(ctx, runId, deps = {}) {
+  const { HOME, DIR } = ctx;
+  if (!/^[\w.-]+$/.test(runId)) return { code: 400, body: { error: 'invalid run id' } };
+  if (!fs.existsSync(path.join(DIR, 'runs', runId + '.json'))) return { code: 404, body: { error: 'run not found' } };
+  const procs = loadProcs(deps);
+  const lock = path.join(DIR, 'locks', runId + '.lock');
+  const busy = { code: 409, body: { error: 'run already running', running: true } };
+  if (engineAlive(runId, procs)) return busy;
+  const isAlive = deps.isAlive || ((pid) => enginePid(pid, procs));
+  if (!takeLock(lock, { isAlive })) return busy;
+  try {
+    const r = (deps.spawnEngine || spawnEngine)(HOME, runId, ctx);
+    fs.writeFileSync(lock, String(pidOf(r)));
+    watchExit(r, lock);
+    return { code: 200, body: { ok: true } };
+  } catch (e) {
+    try { fs.unlinkSync(lock); } catch {}
+    return { code: 500, body: { error: 'spawn failed' } };
+  }
 }
 
 /**
  * One pass. ctx: { HOME, DIR, getControl, append, log }
- * deps (injectable for tests): startup, spawnEngine(HOME, runId, ctx) -> pid, isAlive(pid),
- *   engineAlive(runId) -> bool, studioProcesses() -> [{pid, cmd}]
+ * deps (injectable for tests): startup, spawnEngine(HOME, runId, ctx) -> child|pid, isAlive(pid),
+ *   engineAlive(runId) -> bool, studioProcesses() -> [{pid, cmd}], MACHINE, liveCount
  */
 function tick(ctx, deps = {}) {
   const { HOME, DIR } = ctx;
   const log = ctx.log || (() => {});
   const control = ctx.getControl ? ctx.getControl() : { state: 'running' };
 
-  // S3: call studioProcesses once per tick
-  let studioProcs = null;
-  try { studioProcs = require('./power').studioProcesses(); } catch {}
+  // One process scan per tick, shared with power.startup via ctx.
+  const studioProcs = loadProcs(deps);
 
   deps = {
     startup: (c) => require('./power').startup(c),
-    spawnEngine: defaultSpawnEngine,
-    isAlive: alive,
-    engineAlive: (runId) => {
-      // S4: match runId as a whole argument token (not substring)
-      return studioProcs && studioProcs.some((p) =>
-        /engine[\\/]engine\.js/.test(p.cmd) && new RegExp('(?<![\\w.-])' + runId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\w.-])').test(p.cmd));
-    },
+    spawnEngine,
+    isAlive: (pid) => enginePid(pid, studioProcs),
+    engineAlive: (runId) => engineAlive(runId, studioProcs),
     ...deps,
   };
   const result = { resumed: [], skipped: [] };
 
-  try { deps.startup({ HOME, DIR, log: (s) => { if (!/still PAUSED/.test(s)) log(s); } }); } catch (e) { log('service check failed: ' + e.message); }
+  try {
+    const p = deps.startup({ HOME, DIR, studioProcs, log: (s) => { if (!/still PAUSED/.test(s)) log(s); } });
+    if (p && typeof p.catch === 'function') p.catch((e) => log('service check failed: ' + e.message));
+  } catch (e) { log('service check failed: ' + e.message); }
 
-  if (control.state !== 'running') { log('switch is Paused: services only'); return result; }
+  if (control.state !== 'running') {
+    clearResumes(DIR); // engines stopped on purpose are not crashes
+    log('switch is Paused: services only');
+    return result;
+  }
 
-  // S2: concurrency cap — count live engines
-  const MACHINE = deps.MACHINE || (function () { try { return require('./machine').load({ HOME, DIR: path.join(HOME, '.studio') }); } catch { return {}; } })();
+  // Concurrency cap from this machine's profile (gpu.llmSlots), default 2.
+  const MACHINE = deps.MACHINE || require('./machine').load(HOME);
   const maxEngines = (MACHINE.gpu && MACHINE.gpu.llmSlots) || 2;
-  const liveCount = deps.liveCount !== undefined ? deps.liveCount : studioProcs ? studioProcs.filter((p) => /engine[\\/]engine\.js/.test(p.cmd)).length : 0;
+  const liveCount = deps.liveCount !== undefined ? deps.liveCount : studioProcs ? studioProcs.filter((p) => ENGINE_RE.test(p.cmd)).length : 0;
 
   // Read roster for team-pause checks
   let roster = null;
@@ -171,7 +241,6 @@ function tick(ctx, deps = {}) {
   const runsDir = path.join(DIR, 'runs');
   const files = fs.existsSync(runsDir) ? fs.readdirSync(runsDir).filter((f) => f.endsWith('.json')) : [];
   for (const f of files) {
-    // S2: concurrency cap — stop spawning if at limit
     if (liveCount + result.resumed.length >= maxEngines) {
       log(`concurrency cap reached (${maxEngines}), skipping remaining runs`);
       break;
@@ -181,12 +250,14 @@ function tick(ctx, deps = {}) {
     const id = run.id || f.replace(/\.json$/, '');
     if (!/^[\w.-]+$/.test(id)) continue;
     if (!RESUMABLE.has(run.status)) { result.skipped.push(id); continue; }
+    const lock = path.join(DIR, 'locks', id + '.lock');
 
-    // S1: team-pause guard — skip run if its current team is paused
+    // Team-pause guard: skip the run if its current team is paused (engine stops on purpose: not a crash)
     const currentStage = run.stages && run.stages[run.cursor];
     if (currentStage && currentStage.agent) {
       const team = teamOf(currentStage.agent, roster);
       if (teamPaused(team, control)) {
+        try { fs.unlinkSync(resumesFile(lock)); } catch {}
         log(`run ${id}: team '${team}' is paused, skipping`);
         result.skipped.push(id);
         continue;
@@ -194,15 +265,14 @@ function tick(ctx, deps = {}) {
     }
 
     if (deps.engineAlive(id)) { log(`run ${id}: engine already live, skipping`); result.skipped.push(id); continue; }
-    const lock = path.join(DIR, 'locks', id + '.lock');
 
-    // S2: crash-loop guard
+    // No engine process for this run: settle how long the last resumed engine lived, then apply the guard.
     const cursor = run.cursor || 0;
+    settleResumes(lock);
     const guard = crashLoopGuard(lock, cursor);
     if (guard.blocked) {
       log(`run ${id}: crash-loop blocked (${guard.reason})`);
       result.skipped.push(id);
-      // Mark the run as blocked in its JSON
       try {
         run.status = 'blocked';
         run.blockedReason = guard.reason;
@@ -214,11 +284,11 @@ function tick(ctx, deps = {}) {
 
     if (!takeLock(lock, deps)) { log(`run ${id}: locked by a live process, skipping`); result.skipped.push(id); continue; }
     try {
-      // S2: record this resume attempt for crash-loop tracking
-      recordResume(lock, cursor);
-      // S5: pass ctx to spawnEngine for logging
-      const pid = deps.spawnEngine(HOME, id, ctx);
+      const r = deps.spawnEngine(HOME, id, ctx);
+      const pid = pidOf(r);
+      recordResume(lock, cursor, pid);
       fs.writeFileSync(lock, String(pid));
+      watchExit(r, lock);
       log(`run ${id}: resumed (was ${run.status}) pid ${pid}`);
       ctx.append({ type: 'progress', agent: 'manager', pct: 0, message: `Supervisor resumed run ${id} (was ${run.status})`, status: 'working' });
       result.resumed.push(id);
@@ -230,33 +300,22 @@ function tick(ctx, deps = {}) {
   return result;
 }
 
-/** Long-running loop with single-instance guard (N5). */
+/** Long-running loop with single-instance guard. */
 function supervise(ctx) {
-  // N5: single-instance guard via supervisor.lock
+  // Single-instance guard: atomic lock, refreshed every tick (heartbeat). A lock not touched for 3 intervals is
+  // stale even if its PID is alive (PID reuse), so a recycled PID can never keep the real supervisor out.
   const supervisorLock = path.join(ctx.DIR, 'locks', 'supervisor.lock');
-  const dir = path.dirname(supervisorLock);
-  fs.mkdirSync(dir, { recursive: true });
-  try {
-    fs.writeFileSync(supervisorLock, String(process.pid), { flag: 'wx' });
-  } catch (e) {
-    if (e.code === 'EEXIST') {
-      const existingPid = Number(fs.readFileSync(supervisorLock, 'utf8'));
-      if (alive(existingPid)) {
-        console.error(`Supervisor already running (pid ${existingPid}). Exiting.`);
-        process.exit(1);
-      }
-      // Stale lock — remove and continue
-      try { fs.unlinkSync(supervisorLock); } catch {}
-      fs.writeFileSync(supervisorLock, String(process.pid));
-    } else {
-      throw e;
-    }
+  if (!takeLock(supervisorLock, { isAlive: alive, staleMs: 3 * INTERVAL_MS })) {
+    // Exit 0: a duplicate start is not a failure, so Task Scheduler must not "restart on failure" it 999 times.
+    console.error('Supervisor already running. Exiting.');
+    process.exit(0);
   }
 
   const log = makeLogger(ctx.DIR);
   const c = { ...ctx, log };
   log(`supervisor started (pid ${process.pid}, every ${INTERVAL_MS / 1000} s)`);
   const pass = () => {
+    try { fs.utimesSync(supervisorLock, new Date(), new Date()); } catch {}
     try { tick(c); } catch (e) { log('tick error: ' + (e.stack || e.message)); }
     // dailyBackup is async (S1) — it logs its own success/failure inside dailyBackup().
     try { dailyBackup(c, log); } catch (e) { log('backup scheduling error: ' + (e.stack || e.message)); }
@@ -278,7 +337,9 @@ function supervise(ctx) {
  *  backup on a busy host can succeed at 04:00 or later without blocking the
  *  entire day.
  *  The backup runs asynchronously (S1) so tick() keeps its 60 s cadence. */
+let backupRunning = false; // in-flight guard: a slow backup must not overlap the next hourly retry
 function dailyBackup(ctx, log, opts = {}) {
+  if (backupRunning) return;
   const now = opts.now || new Date();
   const { localDate: localDateFn, backup: backupFn } = opts;
   const localDate = localDateFn || require('./backup').localDate;
@@ -309,12 +370,18 @@ function dailyBackup(ctx, log, opts = {}) {
 
   // S1: run backup asynchronously so tick() keeps its cadence.
   const doBackup = backupFn || require('./backup').backup;
-  doBackup({ HOME: ctx.HOME, now })
-    .then((dest) => {
+  backupRunning = true;
+  let p;
+  try { p = Promise.resolve(doBackup({ HOME: ctx.HOME, now, log })); } catch (e) { p = Promise.reject(e); }
+  p.then((dest) => {
       if (dest) log('backup done: ' + dest);
       else log('backup: nothing to back up');
     })
-    .catch((e) => { log('backup failed: ' + (e.message || e)); });
+    .catch((e) => { log('backup failed: ' + (e.message || e)); })
+    .finally(() => { backupRunning = false; });
 }
 
-module.exports = { tick, supervise, makeLogger, takeLock, INTERVAL_MS, dailyBackup, teamOf, teamPaused, crashLoopGuard, recordResume, TEAM_FALLBACK, TEAMS };
+module.exports = {
+  tick, supervise, makeLogger, takeLock, releaseLock, INTERVAL_MS, dailyBackup, teamOf, teamPaused, crashLoopGuard,
+  recordResume, settleResumes, TEAM_FALLBACK, TEAMS, spawnEngine, resumeRun, enginePid, engineAlive, alive,
+};

@@ -19,7 +19,7 @@ function scan(dir) {
   for (const e of fs.readdirSync(dir)) {
     const fp = path.join(dir, e);
     const st = fs.statSync(fp);
-    if (st.isDirectory()) { scan(fp); }
+    if (st.isDirectory()) { if (e !== 'node_modules' && e !== 'app-dist') scan(fp); }
     else if (e.endsWith('.ps1') || e.endsWith('.cmd')) { files.push(fp); }
   }
 }

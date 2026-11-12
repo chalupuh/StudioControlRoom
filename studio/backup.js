@@ -107,6 +107,9 @@ function localDate(d = new Date()) {
 async function backup(opts = {}) {
   const HOME = opts.HOME || studioHome();
   const now = opts.now || new Date();
+  const log = opts.log || console.log;
+  const cp = opts.cp || ((src, dst) => fs.cpSync(src, dst, { recursive: true })); // injectable for tests
+  const zip = opts.zip || zipFiles;
   const srcFiles = collectSources(HOME);
   if (srcFiles.length === 0) {
     console.log('backup: nothing to back up (no runs/checkpoints/docs found).');
@@ -123,39 +126,28 @@ async function backup(opts = {}) {
   // S7: staging dir created inside the async function, cleaned up in finally
   const staging = fs.mkdtempSync(path.join(os.tmpdir(), 'studio-backup-'));
   try {
-    // S8: stage under .studio/ and docs/ parent directories
-    const stagingStudio = path.join(staging, '.studio');
-    const stagingDocs = path.join(staging, 'docs');
-    fs.mkdirSync(stagingStudio, { recursive: true });
-    fs.mkdirSync(stagingDocs, { recursive: true });
-
-    const studioItems = ['runs', 'checkpoints'];
-    for (const item of studioItems) {
-      const src = path.join(HOME, '.studio', item);
-      try { fs.cpSync(src, path.join(stagingStudio, item), { recursive: true }); } catch {}
+    // Stage each source under its HOME-relative path (.studio/..., docs/internal) so the zip restores in place.
+    const missing = [];
+    for (const src of srcFiles) {
+      const rel = path.relative(HOME, src);
+      const dst = path.join(staging, rel);
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      missing.push(...copyItem(cp, src, dst, rel));
     }
-    // Flat files under .studio/
-    for (const file of ['roster.json', 'events.jsonl']) {
-      const src = path.join(HOME, '.studio', file);
-      try { fs.copyFileSync(src, path.join(stagingStudio, file)); } catch {}
+    if (missing.length) {
+      // Do not pretend the backup is complete: say what is missing, inside the archive and in the log.
+      fs.writeFileSync(path.join(staging, 'MISSING.txt'), 'These items could not be copied (locked or unreadable):\n' + missing.join('\n') + '\n');
+      log(`backup partial: ${missing.join(', ')}`);
     }
-    // docs/internal
-    const docsSrc = path.join(HOME, 'docs', 'internal');
-    try { fs.cpSync(docsSrc, path.join(stagingDocs, 'internal'), { recursive: true }); } catch {}
 
     console.log(`backup: creating ${dest}`);
     console.log(`backup: sources: ${srcFiles.join(', ')}`);
 
-    // S6: zip to .partial
-    await zipFiles([staging], partial); // zips staging contents: entries start with .studio/ and docs/
+    await zip([staging], partial); // zips staging contents: entries start with .studio/ and docs/
 
-    // Verify partial was created and has content
     const sz = fs.statSync(partial).size;
-    if (sz === 0) {
-      throw new Error('backup: created archive is empty');
-    }
+    if (sz === 0) throw new Error('backup: created archive is empty');
 
-    // Rename .partial to final .zip
     fs.renameSync(partial, dest);
     console.log(`backup: ${dest} (${sz.toLocaleString()} bytes)`);
 
@@ -167,13 +159,33 @@ async function backup(opts = {}) {
 
     return dest;
   } catch (e) {
-    // S6: clean up partial on failure
     try { fs.unlinkSync(partial); } catch {}
     throw e;
   } finally {
-    // S7: always clean up staging directory
     try { fs.rmSync(staging, { recursive: true, force: true }); } catch {}
   }
+}
+
+/** Copy one source; retry once; for a directory that still fails, copy file by file and report only what failed.
+ *  Returns the list of HOME-relative items that could not be copied (empty = complete). */
+function copyItem(cp, src, dst, rel) {
+  for (let i = 0; i < 2; i++) { try { cp(src, dst); return []; } catch {} }
+  let isDir = false; try { isDir = fs.statSync(src).isDirectory(); } catch {}
+  if (!isDir) return [rel];
+  const failed = [];
+  const walk = (s, d, r) => {
+    let names; try { names = fs.readdirSync(s, { withFileTypes: true }); } catch { failed.push(r); return; }
+    try { fs.mkdirSync(d, { recursive: true }); } catch {}
+    for (const e of names) {
+      const sp = path.join(s, e.name), dp = path.join(d, e.name), rp = r + '/' + e.name;
+      if (e.isDirectory()) { walk(sp, dp, rp); continue; }
+      let ok = false;
+      for (let i = 0; i < 2 && !ok; i++) { try { cp(sp, dp); ok = true; } catch {} }
+      if (!ok) failed.push(rp);
+    }
+  };
+  walk(src, dst, rel.split(path.sep).join('/'));
+  return failed;
 }
 
 module.exports = { backup, collectSources, pruneOld, localDate, MAX_KEEP, zipFiles };

@@ -17,6 +17,13 @@ const SUITES = [
   { file: 'selftest-supervisor.js',   label: 'supervisor (resume paused, skip blocked, no double start)' },
   { file: 'selftest-backup.js',       label: 'backup (collect sources, prune old zips)' },
   { file: 'selftest-ps1-ascii.js',    label: 'ps1/cmd files are ASCII-only (PowerShell 5.1 compat)' },
+  { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
+  { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
+  { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
+  { file: 'selftest-filepath.js',     label: '/api/file path resolution (gate links)' },
+  { file: 'selftest-local-env.js',    label: 'local tier context window env' },
+  { file: 'selftest-finalize.js',     label: 'finalize turn on turn cap, local server check' },
+  { file: 'selftest-recurring.js',    label: 'usage-limit waits, misplaced reports, stale rules, headless permissions' },
 ];
 
 let anyFailed = false;

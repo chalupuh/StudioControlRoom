@@ -4,6 +4,7 @@ import type { useStudio } from '../../store';
 import { Chart, MobileList } from './Chart';
 import { Drawer } from './Drawer';
 import { Trail } from './Trail';
+import { ModelsNow } from './ModelsNow';
 import { buildOrg, packetFor, type Packet } from './model';
 import './org.css';
 
@@ -52,6 +53,7 @@ export function OrgView({ studio }: { studio: ReturnType<typeof useStudio> }) {
   return (
     <div className="o-root">
       <div className="o-main">
+        <ModelsNow live={live} roster={state.roster} onOpen={common.onOpen} />
         {narrow ? <MobileList depts={depts} {...common} /> : <Chart depts={depts} packets={packets} {...common} />}
       </div>
       <Trail events={state.events} roster={state.roster} now={now} onOpen={common.onOpen} />

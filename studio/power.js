@@ -24,9 +24,9 @@ function studioProcesses() {
 const kill = (pid) => { if (isWin) ps(`Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue`); else try { process.kill(pid, 'SIGKILL'); } catch {} };
 const gpuUsed = () => { try { return execFileSync('nvidia-smi', ['--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'], { encoding: 'utf8' }).trim(); } catch { return 'n/a'; } };
 
-async function unloadOllama() {
+async function unloadOllama(home) {
   try {
-    const base = machine.ollamaUrl(machine.load());
+    const base = machine.ollamaUrl(machine.load(home));
     const r = await fetch(base + '/api/ps', { signal: AbortSignal.timeout(3000) });
     const { models = [] } = await r.json();
     for (const m of models) await fetch(base + '/api/generate', { method: 'POST', body: JSON.stringify({ model: m.name, keep_alive: 0 }), signal: AbortSignal.timeout(10000) }).catch(() => {});
@@ -68,7 +68,7 @@ async function shutdown(ctx) {
   } else step('All agents stopped on their own');
 
   // 3. Local models: unload, then stop Ollama entirely (tray app + server).
-  const unloaded = await unloadOllama();
+  const unloaded = await unloadOllama(ctx.HOME);
   for (const p of studioProcesses().filter((p) => /^ollama/i.test(p.name))) kill(p.pid);
   step(`Ollama stopped${unloaded.length ? ' (unloaded ' + unloaded.join(', ') + ')' : ''}`);
 
@@ -89,32 +89,59 @@ async function shutdown(ctx) {
   // 5. The Control Room server itself (last, so the UI can show the result first).
   if (!ctx.keepServer) {
     const pidFile = path.join(ctx.DIR, 'server.pid');
-    try { const pid = Number(fs.readFileSync(pidFile, 'utf8')); if (pid && pid !== process.pid) { kill(pid); step('Control Room server stopped'); } fs.unlinkSync(pidFile); } catch {}
+    try {
+      const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+      // server.pid can be stale (PID recycled): only kill it while the Control Room actually answers.
+      const { host, port } = serverAddr(machine.load(ctx.HOME));
+      if (pid && pid !== process.pid && await probeServer(host, port)) { kill(pid); step('Control Room server stopped'); }
+      fs.unlinkSync(pidFile);
+    } catch {}
   }
   return report;
 }
 
-/** Start everything back up (does NOT resume work — the owner flips the switch for that). */
-function startup(ctx) {
+/** Control Room answering on its port? Any HTTP response counts (401 in LAN mode is still "up"). A PID check is not
+ *  enough: a stale server.pid can name a recycled PID, which would stop the server from ever being restarted. */
+function probeServer(host, port, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    const req = require('http').get({ host, port, path: '/api/state', timeout: timeoutMs }, (res) => { res.resume(); resolve(true); });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(false));
+  });
+}
+
+/** Where the Control Room listens, for probing: STUDIO_BIND / PORT env win over machine.json (same as `serve`). */
+function serverAddr(m) {
+  let host = process.env.STUDIO_BIND || m.controlRoom.bind || '127.0.0.1';
+  if (host === '0.0.0.0' || host === '::' || host === 'localhost') host = '127.0.0.1';
+  return { host, port: Number(process.env.PORT) || m.controlRoom.port };
+}
+
+/** Start everything back up (does NOT resume work: the owner flips the switch for that).
+ *  ctx.studioProcs (optional): process scan already taken by the caller (avoids a second CIM query per tick). */
+async function startup(ctx) {
   const log = ctx.log || console.log;
+  const m = machine.load(ctx.HOME);
   if (isWin) {
     // Start the Ollama *server* headless (the tray app doesn't reliably start it and isn't needed).
     const exe = path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe');
-    if (fs.existsSync(exe) && !studioProcesses().some((p) => p.name === 'ollama.exe')) {
-      const m = machine.load(ctx.HOME);
+    const procs = ctx.studioProcs || studioProcesses();
+    if (fs.existsSync(exe) && !procs.some((p) => p.name === 'ollama.exe')) {
+      // Profile values first, then process.env: an env var set by the owner (OLLAMA_*) deliberately wins.
       const env = { OLLAMA_KEEP_ALIVE: String(m.ollama.keepAlive), OLLAMA_HOST: machine.ollamaHost(m), OLLAMA_NUM_PARALLEL: String(m.ollama.numParallel), ...process.env };
       if (m.ollama.contextLength) env.OLLAMA_CONTEXT_LENGTH = String(m.ollama.contextLength);
       spawn(exe, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true, env }).unref(); log('• Ollama server started (headless)');
     } else log('• Ollama already running (or not installed)');
   }
-  const pidFile = path.join(ctx.DIR, 'server.pid');
-  let up = false; try { process.kill(Number(fs.readFileSync(pidFile, 'utf8')), 0); up = true; } catch {}
+  const { host, port } = serverAddr(m);
+  const up = await probeServer(host, port);
   if (!up) {
     const out = fs.openSync(path.join(ctx.DIR, 'server.log'), 'a');
     spawn(process.execPath, [path.join(__dirname, 'studio.js'), 'serve'], { detached: true, stdio: ['ignore', out, out], windowsHide: true }).unref();
-    log('• Control Room server started → http://localhost:' + machine.load(ctx.HOME).controlRoom.port);
+    fs.closeSync(out);
+    log('• Control Room server started -> http://localhost:' + port);
   } else log('• Control Room server already running');
   log('Studio is still PAUSED. Flip the switch to Running (or `studio.js resume`) when you want agents to work.');
 }
 
-module.exports = { shutdown, startup, studioProcesses, gpuUsed };
+module.exports = { shutdown, startup, studioProcesses, gpuUsed, probeServer, serverAddr };

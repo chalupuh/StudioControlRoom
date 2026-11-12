@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Character, ModelInfo, Team } from '../../api';
-import type { AgentLive } from '../../store';
+import { PROVIDER_LABEL, providerOf, type AgentLive } from '../../store';
 import { STATUS_VAR, TEAM_VAR, displayName, initials } from './model';
 
 /** Portrait image with a generated SVG avatar fallback (initials on the character colour). */
@@ -43,6 +43,18 @@ export function StatusPill({ status }: { status: string }) {
   return <span className="o-pill" style={{ ['--st' as string]: STATUS_VAR[status] || 'var(--idle)' }}><i />{status}</span>;
 }
 
+/** The model this employee is using right now (bright, pulsing while working; dim "last" when idle). */
+export function LiveModel({ live }: { live?: AgentLive }) {
+  if (!live?.model) return null;
+  const on = live.status === 'working';
+  const kind = live.provider || providerOf(live.model, live.tier, live.cloud);
+  return (
+    <span className={'o-live ' + kind + (on ? ' on' : '')} title={(on ? 'Using now: ' : 'Last used: ') + live.model + ' (' + PROVIDER_LABEL[kind] + ')'}>
+      <i />{on ? '' : 'last: '}{live.model}<em>{PROVIDER_LABEL[kind]}</em>
+    </span>
+  );
+}
+
 export function ModelChips({ info }: { info?: ModelInfo }) {
   if (!info || (!info.brain && !info.local?.length)) return null;
   return (
@@ -83,6 +95,7 @@ export function AgentCard({ id, c, team, live, models, head, onOpen }: CardProps
           <strong className="o-name">{name}</strong>
           <span className="o-title">{title}</span>
           <StatusPill status={status} />
+          <LiveModel live={live} />
         </div>
       </div>
       <p className="o-task">{live?.task || <em>No active task</em>}</p>

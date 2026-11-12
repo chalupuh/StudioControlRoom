@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { deriveLive, type AgentLive } from './store';
+import { deriveLive, modelOf, type AgentLive } from './store';
+import { groupByModel } from './features/org/ModelsNow';
 import type { StudioEvent } from './api';
 
 function makeEvent(type: StudioEvent['type'], overrides: Partial<StudioEvent> = {}): StudioEvent {
@@ -171,5 +172,56 @@ describe('deriveLive', () => {
     ];
     const result = deriveLive(events);
     expect(result['a'].task).toBe('');
+  });
+});
+
+describe('live model', () => {
+  it('uses explicit model fields from the engine', () => {
+    const r = deriveLive([{ ts: 1, type: 'start', agent: 'mobile-dev', task: 'build#2 [local]', tier: 'local', model: 'qwen3.6:27b', cloud: false }]);
+    expect(r['mobile-dev'].model).toBe('qwen3.6:27b');
+    expect(r['mobile-dev'].cloud).toBe(false);
+  });
+  it('falls back to the [tier] tag in older events', () => {
+    expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'qa#2 [sonnet, retry 2]' })).toEqual({ model: 'sonnet', tier: 'sonnet', cloud: true, provider: 'claude' });
+    expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'qa#2 [local-fast]' }).model).toBe('qwen3-coder:30b');
+    expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'no tag' })).toEqual({});
+  });
+  it('a new start replaces the previous model', () => {
+    const r = deriveLive([
+      { ts: 1, type: 'start', agent: 'qa-engineer', task: 'qa#1 [local]' },
+      { ts: 2, type: 'start', agent: 'qa-engineer', task: 'qa#1 [sonnet, retry 2]' },
+    ]);
+    expect(r['qa-engineer'].model).toBe('sonnet');
+  });
+  it('groups only working agents, local first', () => {
+    const g = groupByModel({
+      a: { status: 'working', pct: 1, task: '', model: 'opus', cloud: true },
+      b: { status: 'working', pct: 1, task: '', model: 'qwen3.6:27b', cloud: false },
+      c: { status: 'done', pct: 100, task: '', model: 'qwen3.6:27b', cloud: false },
+    });
+    expect(g.map((x) => x.model)).toEqual(['qwen3.6:27b', 'opus']);
+    expect(g[0].agents).toEqual(['b']);
+  });
+});
+
+import { providerOf } from './store';
+describe('providers', () => {
+  it('classifies local, Claude and ChatGPT', () => {
+    expect(providerOf('qwen3.6:27b', 'local', false)).toBe('local');
+    expect(providerOf('opus', 'opus', true)).toBe('claude');
+    expect(providerOf('gpt-6.1-sol', 'codex', true)).toBe('chatgpt');
+    expect(providerOf('codex', undefined, undefined)).toBe('chatgpt');
+  });
+  it('start events from the codex tier are ChatGPT', () => {
+    const r = deriveLive([{ ts: 1, type: 'start', agent: 'backend-dev', task: 'build#3 [codex]' }]);
+    expect(r['backend-dev'].provider).toBe('chatgpt');
+  });
+  it('panel groups by provider: local, Claude, ChatGPT', () => {
+    const g = groupByModel({
+      a: { status: 'working', pct: 1, task: '', model: 'gpt-6.1-sol', cloud: true, provider: 'chatgpt' },
+      b: { status: 'working', pct: 1, task: '', model: 'opus', cloud: true, provider: 'claude' },
+      c: { status: 'working', pct: 1, task: '', model: 'qwen3.6:27b', cloud: false, provider: 'local' },
+    });
+    expect(g.map((x) => x.provider)).toEqual(['local', 'claude', 'chatgpt']);
   });
 });

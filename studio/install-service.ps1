@@ -11,6 +11,8 @@
     The supervisor's 60 s tick also runs a daily backup at 03:00 -- no second task needed.
 
     -Uninstall    removes the task
+    -NoElevation  run the task with limited rights (RunLevel Limited) instead of Highest, so agents do not inherit
+                  an elevated admin token. Registering the task itself still needs an elevated shell.
     -WhatIf       dry-run (prints what it would do, builds the real action to validate)
 
     Requirements:
@@ -21,7 +23,9 @@
 param(
     [switch]$Uninstall,
     # Explicit HQ checkout path; defaults to studio.home.json -> $env:STUDIO_HOME.
-    [string]$StudioHome
+    [string]$StudioHome,
+    # Least privilege: do not run the supervisor (and every agent it starts) with the elevated token.
+    [switch]$NoElevation
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,6 +33,7 @@ $ErrorActionPreference = 'Stop'
 $repo   = (Resolve-Path $PSScriptRoot\..).Path
 $script = Join-Path $PSScriptRoot 'studio.js'
 $task   = 'StudioSupervisor'
+$runLevel = if ($NoElevation) { 'Limited' } else { 'Highest' }
 
 # Resolve STUDIO_HOME: explicit param -> studio.home.json -> $env:STUDIO_HOME -> error.
 if (-not $StudioHome) {
@@ -71,11 +76,11 @@ function Register-Task {
 
     $trigger   = New-ScheduledTaskTrigger -AtStartup
     # Run as the current user via S4U (no password stored, works whether logged on or not).
-    # Highest privileges apply to this user, never SYSTEM.
+    # Highest (default) or Limited (-NoElevation) applies to this user, never SYSTEM.
     $principal = New-ScheduledTaskPrincipal `
         -UserId "$env:USERDOMAIN\$env:USERNAME" `
         -LogonType S4U `
-        -RunLevel Highest
+        -RunLevel $runLevel
 
     Register-ScheduledTask -TaskName $task `
         -Action $action `
@@ -87,7 +92,7 @@ function Register-Task {
 
     Write-Host "Installed Scheduled Task '$task'  --  startup trigger, restart on failure (1 min x 999)."
     Write-Host "  STUDIO_HOME = $StudioHome"
-    Write-Host "  Run-as      : $env:USERDOMAIN\$env:USERNAME (S4U, no password stored)"
+    Write-Host "  Run-as      : $env:USERDOMAIN\$env:USERNAME (S4U, no password stored, RunLevel $runLevel)"
 }
 
 function Uninstall-Task {
@@ -120,7 +125,7 @@ if ($Uninstall) {
             -WorkingDirectory $repo
         Write-Host "[WhatIf] Would register Scheduled Task '$task':"
         Write-Host "  Trigger   : At startup"
-        Write-Host "  Principal : $env:USERDOMAIN\$env:USERNAME (S4U, no password)"
+        Write-Host "  Principal : $env:USERDOMAIN\$env:USERNAME (S4U, no password, RunLevel $runLevel)"
         Write-Host "  Action    : $($action.Execute) $($action.Arguments)"
         Write-Host "  Restart   : 1 min, up to 999 times"
         Write-Host "  Backup    : daily at 03:00 (inside the supervisor tick)"
