@@ -9,7 +9,7 @@
 // Exit 1  drift detected (generated files would differ)
 // Exit 2  tooling error (missing script, missing source dir, etc.)
 
-const { execSync } = require('child_process');
+const { spawnSync } = require('child_process');
 const path = require('path');
 
 const syncScript = path.join(__dirname, '..', 'sync-codex-agents.js');
@@ -21,18 +21,5 @@ if (home) {
   args.push('--home', process.argv[process.argv.indexOf('--home') + 1]);
 }
 
-try {
-  // Quote each arg to handle paths with spaces
-  const quoted = args.map((a) => `"${a}"`);
-  execSync(`node "${syncScript}" ${quoted.join(' ')}`, {
-    stdio: 'inherit',
-  });
-  process.exit(0);
-} catch (err) {
-  if (err.status === 1) {
-    // --check found drift
-    process.exit(1);
-  }
-  // Unexpected error (script missing, source dir missing, etc.)
-  process.exit(2);
-}
+const r = spawnSync(process.execPath, [syncScript, ...args], { stdio: 'inherit' });
+process.exit(r.status ?? 2);

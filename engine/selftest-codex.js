@@ -11,7 +11,7 @@ fs.mkdirSync(path.join(HOME, '.codex', 'agents'), { recursive: true });
 fs.writeFileSync(path.join(HOME, '.codex', 'agents', 'backend-dev.toml'), 'name = "backend-dev"\ndeveloper_instructions = """\nYou are the ROLE-MARKER engineer.\n"""\n');
 process.env.STUDIO_HOME = HOME;
 // keep findCodex off any real install on this machine
-process.env.LOCALAPPDATA = EMPTY; process.env.HOME = EMPTY; delete process.env.CODX_EXE;
+process.env.LOCALAPPDATA = EMPTY; process.env.HOME = EMPTY; delete process.env.CODX_EXE; delete process.env.CODEX_EXE;
 const engine = require('./engine.js');
 
 let fails = 0;
@@ -126,7 +126,28 @@ const events = () => { try { return fs.readFileSync(path.join(HOME, '.studio', '
   const l = console.log; console.log = () => {}; try { engine.advance(run); } finally { console.log = l; }
   check(tiers.join(',') === 'local,local,codex,sonnet' && run.status === 'done', 'ladder: limited codex falls through to sonnet');
   check(!run.history.some((h) => h.tier === 'codex'), 'ladder: limited codex not recorded as a failed attempt');
+  // Assert that a 'usage' event with limited=true was emitted (Task 3 contract)
+  const usageEvents = events().filter((e) => e.type === 'usage' && e.limited === true);
+  check(usageEvents.length > 0, 'ladder: limited usage event emitted');
 }
+// 8. ladder: skipped codex (binary missing) falls through to sonnet
+{
+  const mk = (id) => ({ id, pipeline: 't', vars: { home: vars.workdir, workdir: vars.workdir }, stages: [{ id: 'b#1', type: 'agent', agent: 'backend-dev', tier: 'local', task: 'x' }], cursor: 0, gates: {}, history: [], status: 'running' });
+  const tiers = [];
+  engine.hooks.runAgent = (s, tier) => {
+    tiers.push(tier);
+    if (tier === 'codex') return { tier, model: 'codex', secs: 0, result: '', error: 'codex binary not found', skipped: true };
+    if (tier === 'sonnet') return { tier, model: 'sonnet', secs: 0, result: 'ok' };
+    return { tier, model: 'x', secs: 0, result: '', error: 'boom' };
+  };
+  const run = mk('l3');
+  const l = console.log; console.log = () => {}; try { engine.advance(run); } finally { console.log = l; }
+  check(tiers.join(',') === 'local,local,codex,sonnet' && run.status === 'done', 'ladder: skipped codex falls through to sonnet');
+  check(!run.history.some((h) => h.tier === 'codex'), 'ladder: skipped codex not recorded in history');
+}
+
+// N7: clean up temp directory
+try { fs.rmSync(HOME, { recursive: true, force: true }); } catch {}
 
 console.log(fails ? `\n${fails} FAILED` : '\nall codex tests passed');
 process.exit(fails ? 1 : 0);

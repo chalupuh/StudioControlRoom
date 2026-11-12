@@ -32,6 +32,7 @@ async function main() {
     check(r === null, 'findCodex returns null when not on PATH');
     process.env.PATH = origPath; process.env.Path = origPath;
     if (orig) process.env.CODX_EXE = orig;
+    fs.rmSync(empty, { recursive: true, force: true });
   }
 
   // 3. findCodex — respects CODX_EXE env var
@@ -73,6 +74,7 @@ async function main() {
     }
     process.env.PATH = origPath; process.env.Path = origPath;
     if (orig) process.env.CODX_EXE = orig;
+    fs.rmSync(empty, { recursive: true, force: true });
   }
 
   // 6. check() with test-based validation (happy path)

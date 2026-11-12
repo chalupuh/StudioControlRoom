@@ -102,7 +102,7 @@ function agentDefinition(name) {
 // ---- Codex runner (ADR 0004) ----
 
 // Minimal TOML parser for .codex/agents/<name>.toml files.
-// Only needs: key = "value", key = """multiline""", key = ['array'].
+// Only needs: key = "value", key = """multiline""", key = '''multiline''', key = ['array'].
 function parseSimpleTOML(src) {
   const result = {};
   const lines = src.replace(/\r\n/g, '\n').split('\n');
@@ -110,9 +110,12 @@ function parseSimpleTOML(src) {
   while (i < lines.length) {
     const line = lines[i].trim();
     if (!line || line.startsWith('#')) { i++; continue; }
-    // Triple-quoted multiline string
+    // Triple-quoted basic string (""")
     const mDQ = line.match(/^(\w+)\s*=\s*"""([\s\S]*?)"""\s*$/);
     if (mDQ) { result[mDQ[1]] = mDQ[2]; i++; continue; }
+    // Triple-quoted literal string (''')
+    const mTSQ = line.match(/^(\w+)\s*=\s*'''([\s\S]*?)'''\s*$/);
+    if (mTSQ) { result[mTSQ[1]] = mTSQ[2]; i++; continue; }
     // Triple-quoted string spanning several lines (the real .codex/agents format)
     const mML = line.match(/^(\w+)\s*=\s*"""(.*)$/);
     if (mML) {
@@ -121,6 +124,16 @@ function parseSimpleTOML(src) {
       while (i < lines.length && !lines[i].includes('"""')) parts.push(lines[i++]);
       if (i < lines.length) { const tail = lines[i].slice(0, lines[i].indexOf('"""')); if (tail) parts.push(tail); }
       result[mML[1]] = parts.join('\n').trim();
+      i++; continue;
+    }
+    // Triple-quoted literal string spanning several lines
+    const mMLSQ = line.match(/^(\w+)\s*=\s*'''(.*)$/);
+    if (mMLSQ) {
+      const parts = mMLSQ[2] ? [mMLSQ[2]] : [];
+      i++;
+      while (i < lines.length && !lines[i].includes("'''")) parts.push(lines[i++]);
+      if (i < lines.length) { const tail = lines[i].slice(0, lines[i].indexOf("'''")); if (tail) parts.push(tail); }
+      result[mMLSQ[1]] = parts.join('\n').trim();
       i++; continue;
     }
     // Single-quoted string
@@ -141,7 +154,7 @@ function parseSimpleTOML(src) {
 }
 
 // Locate the Codex CLI binary.
-// Resolution order: CODEX_EXE (or legacy CODX_EXE) env → .studio/machine.json.codexExe → ~/.local/bin/codex → PATH lookup.
+// Resolution order: CODEX_EXE (or legacy CODX_EXE) env → .studio/machine.json.codexExe → platform-specific install dir → PATH lookup.
 function findCodex() {
   if (process.env.CODEX_EXE || process.env.CODX_EXE) return process.env.CODEX_EXE || process.env.CODX_EXE; // CODX_EXE: legacy spelling
   try { const c = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); if (c.codexExe) return c.codexExe; } catch {}
@@ -212,15 +225,22 @@ function runCodex(stage, vars, feedback, reworkNote) {
   const args = ['exec', '--json', '--sandbox', 'workspace-write', '--skip-git-repo-check', '-'];
   const t0 = Date.now();
   const exe = findCodex();
-  // .cmd/.bat shims need a shell on Windows; quote the path in that case.
-  const shell = !!exe && /\.(cmd|bat)$/i.test(exe);
+  // Resolve .cmd/.bat npm shims to the actual module so we can spawn node directly
+  // (no shell) — avoids orphaned grandchildren when spawnSync times out.
+  let resolved = exe;
+  if (exe && /\.(cmd|bat)$/i.test(exe)) {
+    const npmPrefix = path.dirname(path.dirname(process.execPath));
+    const modBin = path.join(npmPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    if (fs.existsSync(modBin)) resolved = modBin;
+  }
   const r = exe
-    ? spawnSync(shell ? `"${exe}"` : exe, args, { cwd, shell, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 })
+    ? (resolved !== exe
+      ? spawnSync(process.execPath, [resolved, ...args], { cwd, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 })
+      : spawnSync(exe, args, { cwd, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 }))
     : { status: null, error: Object.assign(new Error('codex not found'), { code: 'ENOENT' }), stdout: '', stderr: '' };
   const p = parseCodexOutput(r);
   const base = { tier: 'codex', model: 'codex', secs: Math.round((Date.now() - t0) / 1000), cloud: true };
   if (p.missing) {
-    ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'warning', message: `${stage.id}: codex binary not found, skipping codex tier` });
     return { ...base, result: '', error: 'codex binary not found', usage: null, turns: 0, skipped: true };
   }
   return { ...base, result: p.result, error: p.error, usage: p.usage, turns: p.turns, ...(p.limited ? { limited: true } : {}) };

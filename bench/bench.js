@@ -73,10 +73,19 @@ const flatPrompt = (messages) => {
 
 function spawnCli(exe, args, input) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bench-cli-'));
-  const shell = /\.(cmd|bat)$/i.test(exe); // npm shims need a shell on Windows; real binaries do not
+  // Resolve .cmd/.bat npm shims to the actual module so we can spawn node directly
+  // (no shell) — avoids orphaned grandchildren when spawnSync times out.
+  let resolved = exe;
+  if (/\.(cmd|bat)$/i.test(exe)) {
+    const npmPrefix = path.dirname(path.dirname(process.execPath));
+    const modBin = path.join(npmPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+    if (fs.existsSync(modBin)) resolved = modBin;
+  }
   const t0 = Date.now();
   try {
-    const r = spawnSync(shell ? `"${exe}"` : exe, args, { input, cwd: dir, shell, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
+    const r = resolved !== exe
+      ? spawnSync(process.execPath, [resolved, ...args], { input, cwd: dir, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 })
+      : spawnSync(exe, args, { input, cwd: dir, encoding: 'utf8', timeout: 300000, maxBuffer: 64 * 1024 * 1024 });
     return { r, secs: (Date.now() - t0) / 1000 };
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }

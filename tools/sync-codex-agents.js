@@ -57,13 +57,17 @@ function readAgents(dir) {
 }
 
 // ---- generate TOML ----
+// Use ''' literal strings so backslashes in agent bodies (Windows paths, regex) do not break TOML.
 function toTOML(agent) {
+  if (agent.body.includes("'''")) {
+    throw new Error(`Agent ${agent.name} body contains ''' — cannot serialize to literal TOML string`);
+  }
   const lines = [
     `name = "${agent.name}"`,
     `description = ${JSON.stringify(agent.description)}`,
-    `developer_instructions = """`,
+    "developer_instructions = '''",
     agent.body,
-    '"""',
+    "'''",
   ];
   return lines.join('\n') + '\n';
 }
@@ -75,7 +79,7 @@ function toAgentsMd(txt) {
     .replace(/CLAUDE\.md/g, 'AGENTS.md')
     .replace(/\.claude\//g, '.codex/')
     .replace(/Claude Code/g, 'Codex')
-    .replace(/Claude(?! (?:Opus|Sonnet|Haiku)\b)/g, 'Codex');
+    .replace(/Claude(?! (?:Opus|Sonnet|Haiku|Code)\b)/g, 'Codex');
 }
 
 // ---- main ----
@@ -85,7 +89,15 @@ const codexDir = path.join(home, '.codex', 'agents');
 
 if (!fs.existsSync(agentsDir)) {
   console.error(`ERROR: ${agentsDir} not found`);
-  process.exit(1);
+  process.exit(2); // exit 2 = tooling error (missing source), not drift
+}
+
+const isWrite = process.argv.includes('--write');
+const isCheck = process.argv.includes('--check');
+
+// Only create .codex/agents under --write; --check must be read-only
+if (isWrite && !fs.existsSync(codexDir)) {
+  fs.mkdirSync(codexDir, { recursive: true });
 }
 
 const agents = readAgents(agentsDir);
@@ -94,17 +106,13 @@ const agentsMd = path.join(home, 'AGENTS.md');
 const wantAgentsMd = fs.existsSync(claudeMd) ? toAgentsMd(readText(claudeMd)) : null;
 const manifest = { agents: agents.map((a) => a.name) };
 
-if (!fs.existsSync(codexDir)) {
-  fs.mkdirSync(codexDir, { recursive: true });
-}
-
 // Compute what would change
 const actions = [];
 for (const agent of agents) {
   const target = path.join(codexDir, agent.name + '.toml');
   const want = toTOML(agent);
   if (fs.existsSync(target)) {
-    const have = fs.readFileSync(target, 'utf8');
+    const have = readText(target); // CRLF-safe comparison
     if (have !== want) actions.push({ name: agent.name, change: 'update' });
     else actions.push({ name: agent.name, change: 'ok' });
   } else {
@@ -113,18 +121,29 @@ for (const agent of agents) {
 }
 
 // Check for stale files (in .codex/ but not in .claude/)
-const codexFiles = fs.readdirSync(codexDir).filter((f) => f.endsWith('.toml'));
-const known = new Set(agents.map((a) => a.name));
-for (const f of codexFiles) {
-  const base = f.replace(/\.toml$/, '');
-  if (!known.has(base)) {
-    actions.push({ name: base, change: 'stale' });
+if (fs.existsSync(codexDir)) {
+  const codexFiles = fs.readdirSync(codexDir).filter((f) => f.endsWith('.toml'));
+  const known = new Set(agents.map((a) => a.name));
+  for (const f of codexFiles) {
+    const base = f.replace(/\.toml$/, '');
+    if (!known.has(base)) {
+      actions.push({ name: base, change: 'stale' });
+    }
   }
 }
 
 if (wantAgentsMd !== null) {
   if (!fs.existsSync(agentsMd)) actions.push({ name: 'AGENTS.md', change: 'add' });
   else actions.push({ name: 'AGENTS.md', change: readText(agentsMd) === wantAgentsMd ? 'ok' : 'update' });
+}
+
+// Check manifest.json (S3: manifest must be included in --check)
+const mf = path.join(home, '.codex', 'manifest.json');
+const wantManifest = JSON.stringify(manifest, null, 2) + '\n';
+if (fs.existsSync(mf)) {
+  actions.push({ name: 'manifest.json', change: readText(mf) === wantManifest ? 'ok' : 'update' });
+} else {
+  actions.push({ name: 'manifest.json', change: 'add' });
 }
 
 // Summary

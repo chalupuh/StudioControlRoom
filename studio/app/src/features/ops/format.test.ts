@@ -66,6 +66,12 @@ describe('providerRows', () => {
     expect(rows.map((r) => r.id)).toEqual(['ollama', 'openai']);
     expect(rows[1]).toEqual({ id: 'openai', label: 'OpenAI (Codex)', ...u });
   });
+
+  it('includes anthropic provider with correct label', () => {
+    const u = { runs: 3, tokens: 500, attempts: 4, limited: 0 };
+    const rows = providerRows({ anthropic: u });
+    expect(rows).toEqual([{ id: 'anthropic', label: 'Anthropic (Claude)', ...u }]);
+  });
 });
 
 describe('isCloudTier', () => {

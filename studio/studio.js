@@ -246,9 +246,20 @@ function getUsage() {
     p.attempts++; p.tokens += tok;
     if (e.limited) p.limited++; else p.runs++;
     const a = (byAgent[e.agent] = byAgent[e.agent] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
-    a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.calls++; a.secs += Number(e.secs) || 0;
-    if (days[k]) days[k][cloud ? 'cloudTokens' : 'localTokens'] += tok;
-    if (k === todayKey) { today[cloud ? 'cloudTokens' : 'localTokens'] += tok; today[cloud ? 'cloudCalls' : 'localCalls']++; }
+    a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.secs += Number(e.secs) || 0;
+    // S5: limited events don't count as calls (they are skipped, not executed)
+    if (!e.limited) a.calls++;
+    // byDay cloud tokens only count Anthropic (the daily budget is for Claude API)
+    if (days[k]) {
+      if (prov === 'anthropic') { days[k].cloudTokens += tok; }
+      else if (!cloud) { days[k].localTokens += tok; }
+      // codex (openai) tokens are tracked in byProvider but not in byDay cloud budget
+    }
+    // today cloud budget and cloud calls only count Anthropic
+    if (k === todayKey) {
+      if (prov === 'anthropic' && !e.limited) { today.cloudTokens += tok; today.cloudCalls++; }
+      else if (!cloud && !e.limited) { today.localTokens += tok; today.localCalls++; }
+    }
   }
   return { budget, today, byAgent, byProvider, byDay: Object.values(days) };
 }
