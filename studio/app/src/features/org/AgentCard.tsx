@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Character, ModelInfo, Team } from '../../api';
-import type { AgentLive } from '../../store';
+import { PROVIDER_LABEL, providerOf, type AgentLive } from '../../store';
 import { STATUS_VAR, TEAM_VAR, displayName, initials } from './model';
 
 /** Portrait image with a generated SVG avatar fallback (initials on the character colour). */
@@ -47,10 +47,10 @@ export function StatusPill({ status }: { status: string }) {
 export function LiveModel({ live }: { live?: AgentLive }) {
   if (!live?.model) return null;
   const on = live.status === 'working';
-  const kind = live.cloud ? 'cloud' : 'local';
+  const kind = live.provider || providerOf(live.model, live.tier, live.cloud);
   return (
-    <span className={'o-live ' + kind + (on ? ' on' : '')} title={(on ? 'Using now: ' : 'Last used: ') + live.model + (live.cloud ? ' (cloud)' : ' (local GPU)')}>
-      <i />{on ? '' : 'last: '}{live.model}<em>{live.cloud ? 'cloud' : 'local'}</em>
+    <span className={'o-live ' + kind + (on ? ' on' : '')} title={(on ? 'Using now: ' : 'Last used: ') + live.model + ' (' + PROVIDER_LABEL[kind] + ')'}>
+      <i />{on ? '' : 'last: '}{live.model}<em>{PROVIDER_LABEL[kind]}</em>
     </span>
   );
 }
