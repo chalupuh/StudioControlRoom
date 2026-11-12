@@ -367,6 +367,8 @@ const allowedToolsFor = (stage, cwd) => [...new Set([...BASE_ALLOWED_TOOLS, ...(
 
 // ---- run one agent stage on a given tier ----
 // opts.resume continues an earlier session (the finalize turn) with opts.prompt and opts.maxTurns.
+const LOCAL_TIMEOUT_MIN = Number(process.env.STUDIO_LOCAL_TIMEOUT_MIN) || 10;
+
 function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
   const tier = TIERS[tierName];
   // ADR 0004: codex tier uses the Codex CLI, not Claude Code
@@ -410,7 +412,9 @@ ${unattendedRules(stage, cwd)}`;
   // command line. Pushing, merging and destructive git stay with the ship script and the owner.
   args.push('--allowedTools', ...allowedToolsFor(stage, cwd), '--disallowedTools', ...DISALLOWED_TOOLS);
   const t0 = Date.now();
-  const r = spawnSync(claudeExe(), args, { cwd: workdir(vars), env, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 });
+  // Local models can stall for the whole stage budget; cap them so the ladder falls through to Codex quickly.
+  const limitMin = tier.local ? Math.min(stage.timeoutMin || 30, stage.localTimeoutMin || LOCAL_TIMEOUT_MIN) : (stage.timeoutMin || 30);
+  const r = spawnSync(claudeExe(), args, { cwd: workdir(vars), env, input: prompt, encoding: 'utf8', timeout: limitMin * 60000, maxBuffer: 64 * 1024 * 1024 });
   const parsed = parseRunOutput(r);
   return {
     tier: tierName, model: tier.model, secs: Math.round((Date.now() - t0) / 1000),
@@ -865,7 +869,7 @@ function refreshStages(run) {
     // a foreach not expanded yet has no per-item values: take its inner stages from the template wholesale
     if (s.type === 'foreach' && t.type === 'foreach') { if (JSON.stringify(s.stages) !== JSON.stringify(t.stages)) { s.stages = JSON.parse(JSON.stringify(t.stages)); changed++; } continue; }
     // turn and time limits carry no per-item values
-    for (const k of ['maxTurns', 'timeoutMin']) if (t[k] !== undefined && s[k] !== t[k]) { s[k] = t[k]; changed++; }
+    for (const k of ['maxTurns', 'timeoutMin', 'localTimeoutMin']) if (t[k] !== undefined && s[k] !== t[k]) { s[k] = t[k]; changed++; }
     if (t.rework && !s.rework) { // a stage that gained a rework loop since the run started
       s.rework = JSON.parse(JSON.stringify(t.rework));
       if (m) s.rework.verdict = fill(s.rework.verdict, { ...run.vars, n: Number(m[1]) });
