@@ -14,6 +14,7 @@ process.env.STUDIO_HOME = HOME;
 // keep findCodex off any real install on this machine
 process.env.LOCALAPPDATA = EMPTY; process.env.HOME = EMPTY; delete process.env.CODX_EXE; delete process.env.CODEX_EXE;
 const engine = require('./engine.js');
+engine.hooks.localReady = () => true; // no real Ollama check in tests
 
 let fails = 0;
 const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) fails++; };
