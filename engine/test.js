@@ -14,6 +14,10 @@ const SUITES = [
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-rework-baseline.js', label: 'rework baseline, QA manifest gate, sprint-rework routing, limit errors' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
+  { file: 'selftest-machine.js',      label: 'per-machine profile (machine.json)' },
+  { file: 'selftest-supervisor.js',   label: 'supervisor (resume paused, skip blocked, no double start)' },
+  { file: 'selftest-backup.js',       label: 'backup (collect sources, prune old zips)' },
+  { file: 'selftest-ps1-ascii.js',    label: 'ps1/cmd files are ASCII-only (PowerShell 5.1 compat)' },
   { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
   { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
   { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
@@ -21,6 +25,10 @@ const SUITES = [
   { file: 'selftest-local-env.js',    label: 'local tier context window env' },
   { file: 'selftest-finalize.js',     label: 'finalize turn on turn cap, local server check' },
   { file: 'selftest-recurring.js',    label: 'usage-limit waits, misplaced reports, stale rules, headless permissions' },
+  { file: 'selftest-codex.js',        label: 'codex tier (fake codex on PATH)' },
+  { file: '../bench/bench-providers.test.js', label: 'bench provider routing' },
+  { file: '../tools/sync-codex-agents.test.js', label: 'sync-codex-agents / check-config' },
+  { file: '../studio/usage.test.js', label: 'usage reducer (provider split)' },
 ];
 
 let anyFailed = false;

@@ -1,9 +1,16 @@
 node_modules/
 studio/app-dist/
-bench/results/
+bench/results/*
+!bench/results/providers-*.md
 # machine-local: points at this PC's AIDevCompanyHQ checkout
 studio.home.json
+# per-machine profile (see studio/machine.example.json)
+.studio/machine.json
+# daily backups (kept locally, up to 14)
+.studio/backups/
 *.log
 *.part
 temp_*
+
+# runtime data of a stray local HOME
 .studio/

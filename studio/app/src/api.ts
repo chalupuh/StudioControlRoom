@@ -16,7 +16,8 @@ export interface StudioEvent {
   tool?: string; detail?: string;
   run?: string;             // engine run id (gate events)
   // usage events (engine): one per stage attempt
-  tier?: 'local' | 'local-fast' | 'sonnet' | 'opus'; model?: string; cloud?: boolean;
+  tier?: 'local' | 'local-fast' | 'codex' | 'sonnet' | 'opus'; model?: string; cloud?: boolean;
+  provider?: 'ollama' | 'anthropic' | 'openai'; limited?: boolean;
   tokensIn?: number; tokensOut?: number; secs?: number;
 }
 
@@ -46,10 +47,15 @@ export interface RunSummary {
   attempts: { stage: string; agent?: string; tier?: string; ok: boolean; secs?: number; problems?: string[]; at: string }[];
 }
 
+export type Provider = 'ollama' | 'anthropic' | 'openai';
+/** runs = completed attempts; attempts = runs + rate-limited attempts; limited = attempts that hit a limit. */
+export interface ProviderUsage { runs: number; tokens: number; attempts: number; limited: number; }
+
 export interface Usage {
   budget: { dailyCloudTokens: number };                      // .studio/budget.json
   today: { cloudTokens: number; localTokens: number; cloudCalls: number; localCalls: number };
   byAgent: Record<string, { cloudTokens: number; localTokens: number; calls: number; secs: number }>;
+  byProvider: Partial<Record<Provider, ProviderUsage>>;      // events without a provider are inferred from tier/cloud
   byDay: { day: string; cloudTokens: number; localTokens: number }[];   // last 14 days
 }
 

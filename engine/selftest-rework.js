@@ -70,7 +70,7 @@ const quiet = (fn) => { const l = console.log; console.log = () => {}; try { ret
   const log = []; fake(['crash', 'crash', 'crash'], log);
   const run = mkRun('r4', 3); quiet(() => engine.advance(run));
   const tiers = log.filter((l) => l.id === 'qa#1').map((l) => l.tier);
-  check(tiers.join(',') === 'local,local,sonnet', 'crashed QA climbs local, local, sonnet');
+  check(tiers.join(',') === 'local,local,codex,sonnet', 'crashed QA climbs local, local, codex, sonnet');
   check(run.status === 'blocked' && /failed on every tier/.test(run.blockedReason) && !run.reworks, 'blocked as a genuine failure, no rework');
 }
 // 5. no report, clean run -> genuine failure too

@@ -7,9 +7,11 @@
 //   node .studio/studio.js pause | resume | status        <- safe stop / start switch
 //   node .studio/studio.js checkpoint <agent> "<where>" "<next>" ["<files>"]
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
-//   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
+//   node studio/studio.js supervise                       <- long-running: keep services up, resume paused/running runs (60 s)
+//   node studio/studio.js backup                          <- one daily backup now
 //   node studio/studio.js token [rotate]                  <- show current token / rotate it
 //   node studio/studio.js pair [port]                     <- LAN pairing URL(s) + QR code for a phone
+//   node studio/studio.js shutdown | startup              <- Game mode: one-shot total shutdown / bring back
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -20,15 +22,32 @@ const auth = require('./auth');
 
 // SOFT = where this software lives (dashboard.html, app-dist). HOME = the org workspace (agents, docs,
 // runtime data in HOME/.studio). They are the same folder today; after the StudioControlRoom split they differ.
-// HOME: STUDIO_HOME env → studio.home.json next to the software → legacy (parent of this file's folder).
+// HOME: --home CLI arg → STUDIO_HOME env → studio.home.json next to the software → error (no repo-root fallback).
 const SOFT = __dirname;
-function studioHome() {
-  if (process.env.STUDIO_HOME) return path.resolve(process.env.STUDIO_HOME);
-  try { const c = JSON.parse(fs.readFileSync(path.join(SOFT, '..', 'studio.home.json'), 'utf8')); if (c.home) return path.resolve(c.home); } catch {}
+
+/* Parse --home <path> from argv and set STUDIO_HOME so children inherit it.
+   This lets the boot task register node directly with `-Argument '… --home "C:\HQ"'`
+   instead of relying on per-action environment variables (which Task Scheduler does not support). */
+(function parseHomeArg() {
+  const idx = process.argv.indexOf('--home');
+  if (idx !== -1 && process.argv[idx + 1]) {
+    process.env.STUDIO_HOME = process.argv[idx + 1];
+    process.argv.splice(idx, 2); // N11: keep positional args (e.g. `serve --home X 4800`) intact
+  }
+})();
+
+/** Resolve HOME. If strict is true (for supervise/backup), exit 1 if HOME cannot be resolved. */
+function studioHome(strict) {
+  const h = require('./machine').studioHome(null); // shared rule: STUDIO_HOME (from --home) -> studio.home.json
+  if (h) return h;
+  if (strict) { console.error('Cannot resolve STUDIO_HOME. Pass --home <path>, set STUDIO_HOME, or create studio.home.json.'); process.exit(1); }
+  // Non-strict fallback (for serve, hook, etc. — safe for dashboard).
   return path.resolve(SOFT, '..');
 }
 const HOME = studioHome();
 const DIR = path.join(HOME, '.studio');
+const machineLib = require('./machine');
+const MACHINE = machineLib.load(HOME); // per-machine profile (HOME/.studio/machine.json)
 const LOG = path.join(DIR, 'events.jsonl');
 
 function append(ev) {
@@ -197,6 +216,7 @@ const readJson = (p, d) => { try { return JSON.parse(fs.readFileSync(p, 'utf8'))
 function parseEvents(text) {
   return text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
+const { usageFromEvents } = require('./usage');
 function readEvents() { return fs.existsSync(LOG) ? parseEvents(fs.readFileSync(LOG, 'utf8')) : []; }
 
 // ---- Auth token ----
@@ -212,21 +232,9 @@ function verifyToken(provided) {
 }
 
 // ---- LAN bind address ----
-// Read machine.json profile (HOME/.studio/machine.json).
-// TODO(lane merge): Lane H's studio/machine.js loads the same file (with defaults + bad-JSON warning).
-// When the lanes merge, replace readMachineConfig/getLanBind with require('./machine').load().controlRoom.bind.
-function readMachineConfig() {
-  try { return JSON.parse(fs.readFileSync(path.join(DIR, 'machine.json'), 'utf8')); } catch { return {}; }
-}
-
 function getLanBind() {
-  // 1. STUDIO_BIND env var
-  if (process.env.STUDIO_BIND) return process.env.STUDIO_BIND;
-  // 2. machine.json controlRoom.bind
-  const mc = readMachineConfig();
-  if (mc.controlRoom && mc.controlRoom.bind) return mc.controlRoom.bind;
-  // 3. default: loopback only
-  return '127.0.0.1';
+  // 1. STUDIO_BIND env var, 2. machine.json controlRoom.bind (via machine.js defaults), 3. loopback only
+  return process.env.STUDIO_BIND || MACHINE.controlRoom.bind || '127.0.0.1';
 }
 
 // ---- Pairing (phone on the LAN) ----
@@ -325,24 +333,9 @@ function getState() {
   return { events: readEvents().slice(-500), control: getControl(), checkpoints: listCheckpoints(), models: modelMap(), roster: readRoster(), runs: listRuns() };
 }
 
-const dayKey = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function getUsage() {
   const budget = { dailyCloudTokens: 200000, ...readJson(path.join(DIR, 'budget.json'), {}) };
-  const today = { cloudTokens: 0, localTokens: 0, cloudCalls: 0, localCalls: 0 };
-  const byAgent = {};
-  const days = {};
-  const todayKey = dayKey(Date.now());
-  for (let i = 13; i >= 0; i--) { const k = dayKey(Date.now() - i * 86400000); days[k] = { day: k, cloudTokens: 0, localTokens: 0 }; }
-  for (const e of readEvents()) {
-    if (e.type !== 'usage') continue;
-    const tok = (Number(e.tokensIn) || 0) + (Number(e.tokensOut) || 0);
-    const k = dayKey(e.ts), cloud = !!e.cloud;
-    const a = (byAgent[e.agent] = byAgent[e.agent] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
-    a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.calls++; a.secs += Number(e.secs) || 0;
-    if (days[k]) days[k][cloud ? 'cloudTokens' : 'localTokens'] += tok;
-    if (k === todayKey) { today[cloud ? 'cloudTokens' : 'localTokens'] += tok; today[cloud ? 'cloudCalls' : 'localCalls']++; }
-  }
-  return { budget, today, byAgent, byDay: Object.values(days) };
+  return { budget, ...usageFromEvents(readEvents(), Date.now()) };
 }
 
 // ---- GPU / Ollama / ComfyUI (cached 2 s, never throws) ----
@@ -363,8 +356,8 @@ function nvidia() {
 async function computeGpu() {
   const [gpus, ollama, comfy] = await Promise.all([
     nvidia().catch(() => []),
-    fetchJson('http://127.0.0.1:11434/api/ps').then((j) => (j.models || []).map((m) => ({ name: m.name || m.model, vramMB: Math.round((m.size_vram || 0) / 1048576), until: m.expires_at }))).catch(() => []),
-    fetchJson('http://127.0.0.1:8188/queue').then((j) => ({ up: true, queueRunning: (j.queue_running || []).length, queuePending: (j.queue_pending || []).length })).catch(() => ({ up: false, queueRunning: 0, queuePending: 0 })),
+    fetchJson(machineLib.ollamaUrl(MACHINE) + '/api/ps').then((j) => (j.models || []).map((m) => ({ name: m.name || m.model, vramMB: Math.round((m.size_vram || 0) / 1048576), until: m.expires_at }))).catch(() => []),
+    fetchJson(MACHINE.comfyUrl.replace(/\/+$/, '') + '/queue').then((j) => ({ up: true, queueRunning: (j.queue_running || []).length, queuePending: (j.queue_pending || []).length })).catch(() => ({ up: false, queueRunning: 0, queuePending: 0 })),
   ]);
   return { gpus, ollama, comfy };
 }
@@ -430,16 +423,11 @@ function readBody(req, limit = 64 * 1024) {
 }
 
 function spawnEngine(args, runId) {
-  fs.mkdirSync(RUNS, { recursive: true });
-  const out = fs.openSync(path.join(RUNS, runId + '.log'), 'a');
-  const child = require('child_process').spawn(process.execPath, [ENGINE, ...args],
-    { cwd: REPO, detached: true, windowsHide: true, stdio: ['ignore', out, out] });
-  child.on('error', () => {});
-  child.unref();
-  fs.closeSync(out);
+  // Shared with the supervisor: output goes to runs/<id>.log through an inherited fd.
+  return require('./supervisor').spawnEngine(HOME, runId, { engine: ENGINE }, args);
 }
 
-function serve(port = 4777) {
+function serve(port = MACHINE.controlRoom.port) {
   const html = path.join(SOFT, 'dashboard.html');
   const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   const text = (res, s, code = 200) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(s); };
@@ -556,9 +544,10 @@ function serve(port = 4777) {
       if (m === 'POST' && (mt = p.match(/^\/api\/runs\/([^/]+)\/resume$/))) {
         const runId = decodeURIComponent(mt[1]);
         if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
-        if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
-        spawnEngine(['resume', runId], runId);
-        return json(res, { ok: true });
+        // Same lock + process-scan rules as the supervisor: a second click (or a run the supervisor already
+        // resumed) gets 409 instead of a second engine.
+        const r = require('./supervisor').resumeRun({ HOME, DIR, engine: ENGINE }, runId);
+        return json(res, r.body, r.code);
       }
       if (p === '/api/file' && m === 'GET') {
         // gate links carry absolute {{home}} paths; resolveDocPath maps those inside HQ to docs/… and refuses the rest
@@ -610,7 +599,7 @@ else if (cmd === 'resume') console.log(setControl('running'));
 else if (cmd === 'status') { console.log(getControl()); for (const c of listCheckpoints()) console.log('\n' + c.text); }
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
-else if (cmd === 'serve') serve(Number(rest[0]) || Number(process.env.PORT) || 4777);
+else if (cmd === 'serve') serve(Number(rest[0]) || Number(process.env.PORT) || MACHINE.controlRoom.port);
 else if (cmd === 'token') {
   // token subcommands: show current token, or rotate (create/replace)
   const sub = rest[0];
@@ -626,5 +615,11 @@ else if (cmd === 'token') {
 else if (cmd === 'pair') pairCommand(rest);
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
+else if (cmd === 'supervise') { const h = studioHome(true); require('./supervisor').supervise({ HOME: h, DIR: path.join(h, '.studio'), getControl, append }); }
+else if (cmd === 'backup') {
+  const h = studioHome(true);
+  const { backup } = require('./backup');
+  backup({ HOME: h }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } console.log('backup written: ' + dest); }).catch((e) => { console.error(e); process.exit(1); });
+}
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | token [rotate] | pair [port]');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | supervise | backup | token [rotate] | pair [port]');

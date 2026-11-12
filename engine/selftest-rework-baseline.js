@@ -55,7 +55,7 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
   const run = mkRun('b1', repo); quiet(() => engine.advance(run));
   const builds = log.filter((l) => l.id === 'build#1'), qas = log.filter((l) => l.id === 'qa#1');
   check(run.status === 'blocked' && /build#1 failed on every tier/.test(run.blockedReason), 'no-op rework builder fails on every tier (blocked)');
-  check(builds.length === 4 && qas.length === 1, 'QA does not run again after a no-op rework');
+  check(builds.length === 5 && qas.length === 1, 'QA does not run again after a no-op rework');
   const h = run.history.filter((x) => x.stage === 'build#1' && x.attempt);
   check(/made no change since the rejection baseline/.test(h[h.length - 1].problems.join()), 'problem names the baseline');
   check(run.reworkRecords[0].status === 'pending', 'record stays pending');
@@ -149,9 +149,9 @@ const cleanReport = () => { for (const f of fs.readdirSync(HOME)) if (/^qa-/.tes
   }, log);
   const run = mkRun('b7', repo); quiet(() => engine.advance(run));
   const tiers = log.filter((l) => l.id === 'build#1').map((l) => l.tier);
-  check(tiers.join() === 'local,local,sonnet', 'initial build, one capped local rework, then straight to sonnet (no second local try): ' + tiers.join());
+  check(tiers.join() === 'local,local,codex', 'initial build, one capped local rework, then straight to codex (no second local try): ' + tiers.join());
   const bl = log.filter((l) => l.id === 'build#1');
-  check(bl[1].opts.maxTurns === 30 && bl[2].tier === 'sonnet' && bl[2].opts.rework === true && bl[2].opts.maxTurns === undefined, 'N1: 30-turn rework cap on local only, cloud tier uses the stage maxTurns');
+  check(bl[1].opts.maxTurns === 30 && bl[2].tier === 'codex' && bl[2].opts.rework === true && bl[2].opts.maxTurns === undefined, 'N1: 30-turn rework cap on local only, cloud tier (codex) uses the stage maxTurns');
   const q = log.filter((l) => l.id === 'qa#1');
   check(q.length === 2 && run.status === 'done', 'QA only runs after the escalated rework produced an accepted result');
 }

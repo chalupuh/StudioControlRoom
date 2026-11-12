@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import type { useStudio } from '../../store';
 import { api, type Gpu, type RunSummary, type Usage } from '../../api';
 import { renderMarkdown } from './markdown';
-import { budgetLevel, fmtDuration, fmtTokens, isCloudTier, isEscalation, needsOwner } from './format';
+import { budgetLevel, fmtDuration, fmtTokens, isCloudTier, isEscalation, needsOwner, providerRows } from './format';
 import './ops.css';
 
 type Studio = ReturnType<typeof useStudio>;
@@ -315,6 +315,7 @@ function Budget() {
   if (!data) body = error ? <ErrorLine msg={error} /> : loading ? <p className="ops-muted">Loading usage…</p> : null;
   else {
     const { budget, today, byAgent, byDay } = data;
+    const providers = providerRows(data.byProvider);
     const used = today.cloudTokens, cap = budget?.dailyCloudTokens || 0;
     const pct = cap > 0 ? Math.round((used / cap) * 100) : 0;
     const level = budgetLevel(used, cap);
@@ -345,10 +346,19 @@ function Budget() {
         </div>
         <h3 className="sub">Last {byDay?.length || 0} days</h3>
         {byDay && byDay.length > 0 ? <Sparkline days={byDay} /> : <p className="ops-muted">No history yet.</p>}
+        <h3 className="sub">By provider</h3>
+        {providers.length === 0 ? <p className="ops-muted">No provider usage recorded.</p> : (
+          <div className="tbl"><table>
+            <thead><tr><th scope="col">Provider</th><th scope="col" className="num">Runs</th><th scope="col" className="num">Tokens</th><th scope="col" className="num">Attempts</th><th scope="col" className="num">Limited</th></tr></thead>
+            <tbody>{providers.map((p) => (
+              <tr key={p.id}><th scope="row">{p.label}</th><td className="num">{p.runs}</td><td className="num">{fmtTokens(p.tokens)}</td><td className="num">{p.attempts}</td><td className="num">{p.limited}</td></tr>
+            ))}</tbody>
+          </table></div>
+        )}
         <h3 className="sub">Top agents by tokens</h3>
         {agents.length === 0 ? <p className="ops-muted">No agent usage recorded.</p> : (
           <div className="tbl"><table>
-            <thead><tr><th scope="col">Agent</th><th scope="col" className="num">Cloud (Claude)</th><th scope="col" className="num">Local (this PC)</th><th scope="col" className="num">Calls</th></tr></thead>
+            <thead><tr><th scope="col">Agent</th><th scope="col" className="num">Cloud</th><th scope="col" className="num">Local (this PC)</th><th scope="col" className="num">Calls</th></tr></thead>
             <tbody>{agents.map((a) => (
               <tr key={a.id}><th scope="row">{a.id}</th><td className="num">{fmtTokens(a.cloudTokens)}</td><td className="num">{fmtTokens(a.localTokens)}</td><td className="num">{a.calls}</td></tr>
             ))}</tbody>
@@ -357,7 +367,7 @@ function Budget() {
       </>
     );
   }
-  return <Card title="Claude Budget" id="ops-budget" className="budget">{body}</Card>;
+  return <Card title="Model usage" id="ops-budget" className="budget">{body}</Card>;
 }
 
 // ---------------------------------------------------------------- GPU
