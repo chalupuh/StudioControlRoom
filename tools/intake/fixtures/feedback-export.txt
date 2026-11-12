@@ -1,0 +1,16 @@
+Feature request center
+One notebook for French, Swedish and Spanish
+Refresh requests
+Show status
+All statuses
+Submitted · French
+user@example.com
+[fr · open path · #practice/avance-retour-achat] I would like a complete new section called "Read Along" where you have paragraphs at a B1 and B2 level that are read aloud and I follow along reading and listening and then write what I think the dialog was about. It a easier version than the listening version we are working on but would help me learn words in context. Maybe make it lore derived from Elden Ring, Dark Souls, or Tainted Grail
+Update status
+Planned · Swedish
+user@example.com
+Please add a "café" mode 🎧
+Second line: écoute d'abord, puis répète.
+
+Third paragraph after a blank line.
+Update status
