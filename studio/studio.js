@@ -197,6 +197,7 @@ const readJson = (p, d) => { try { return JSON.parse(fs.readFileSync(p, 'utf8'))
 function parseEvents(text) {
   return text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
+const { usageFromEvents } = require('./usage');
 function readEvents() { return fs.existsSync(LOG) ? parseEvents(fs.readFileSync(LOG, 'utf8')) : []; }
 
 // ---- Auth token ----
@@ -325,24 +326,9 @@ function getState() {
   return { events: readEvents().slice(-500), control: getControl(), checkpoints: listCheckpoints(), models: modelMap(), roster: readRoster(), runs: listRuns() };
 }
 
-const dayKey = (ts) => { const d = new Date(ts); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 function getUsage() {
   const budget = { dailyCloudTokens: 200000, ...readJson(path.join(DIR, 'budget.json'), {}) };
-  const today = { cloudTokens: 0, localTokens: 0, cloudCalls: 0, localCalls: 0 };
-  const byAgent = {};
-  const days = {};
-  const todayKey = dayKey(Date.now());
-  for (let i = 13; i >= 0; i--) { const k = dayKey(Date.now() - i * 86400000); days[k] = { day: k, cloudTokens: 0, localTokens: 0 }; }
-  for (const e of readEvents()) {
-    if (e.type !== 'usage') continue;
-    const tok = (Number(e.tokensIn) || 0) + (Number(e.tokensOut) || 0);
-    const k = dayKey(e.ts), cloud = !!e.cloud;
-    const a = (byAgent[e.agent] = byAgent[e.agent] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
-    a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.calls++; a.secs += Number(e.secs) || 0;
-    if (days[k]) days[k][cloud ? 'cloudTokens' : 'localTokens'] += tok;
-    if (k === todayKey) { today[cloud ? 'cloudTokens' : 'localTokens'] += tok; today[cloud ? 'cloudCalls' : 'localCalls']++; }
-  }
-  return { budget, today, byAgent, byDay: Object.values(days) };
+  return { budget, ...usageFromEvents(readEvents(), Date.now()) };
 }
 
 // ---- GPU / Ollama / ComfyUI (cached 2 s, never throws) ----

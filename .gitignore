@@ -1,6 +1,7 @@
 node_modules/
 studio/app-dist/
-bench/results/
+bench/results/*
+!bench/results/providers-*.md
 # machine-local: points at this PC's AIDevCompanyHQ checkout
 studio.home.json
 *.log

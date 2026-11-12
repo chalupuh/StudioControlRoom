@@ -71,7 +71,7 @@ console.log('CLI error results');
   r = engine.parseRunOutput({ status: 0, stdout: j({ result: 'Report: ' + 'y'.repeat(600) + ' the 32000 output token maximum was exceeded the 32000 output token maximum', is_error: false }), stderr: '' });
   check(r.error === null, 'long report merely mentioning the token limit → no error');
 
-  // end-to-end: the attempt fails and climbs local → local → sonnet
+  // end-to-end: the attempt fails and climbs local → local → codex → sonnet
   const out = sl(path.join(HOME, 'out.md'));
   const tiers = [];
   engine.hooks.runAgent = (stage, tier) => {
@@ -81,7 +81,7 @@ console.log('CLI error results');
   };
   const run = { id: 'v2', pipeline: 't', vars: { home: sl(HOME) }, stages: [{ id: 'write', type: 'agent', agent: 'product-manager', tier: 'local', task: 't', expect: [out] }], cursor: 0, gates: {}, history: [], status: 'running' };
   quiet(() => engine.advance(run));
-  check(tiers.join(',') === 'local,local,sonnet', `API Error climbs the ladder (got ${tiers.join(',')})`);
+  check(tiers.join(',') === 'local,local,codex,sonnet', `API Error climbs the ladder (got ${tiers.join(',')})`);
   check(run.history[0].ok === false && /run error: API Error/.test(run.history[0].problems[0] || ''), 'API Error attempt recorded ok:false with the error');
   check(run.status === 'done', 'run finishes once a tier succeeds');
 }
