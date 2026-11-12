@@ -144,6 +144,7 @@ function parseRunOutput(r) {
     usageLimit,
     usage: out.usage ? { in: out.usage.input_tokens, out: out.usage.output_tokens, cached: out.usage.cache_read_input_tokens } : null,
     hitTurnCap: out.subtype === 'error_max_turns',
+    sessionId: out.session_id || null,
   };
 }
 
@@ -200,7 +201,8 @@ const DISALLOWED_TOOLS = ['Bash(git push:*)', 'Bash(git reset --hard:*)', 'Bash(
 const allowedToolsFor = (stage, cwd) => [...new Set([...BASE_ALLOWED_TOOLS, ...(commitsWork(stage, cwd) ? COMMIT_TOOLS : []), ...(stage.allowedTools || [])])];
 
 // ---- run one agent stage on a given tier ----
-function runAgent(stage, tierName, vars, feedback, reworkNote) {
+// opts.resume continues an earlier session (the finalize turn) with opts.prompt and opts.maxTurns.
+function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
   const tier = TIERS[tierName];
   const env = { ...process.env };
   const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
@@ -221,7 +223,9 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files at exactly these absolute paths (not inside ${cwd} unless the path says so): ${stage.expect.map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}.`;
   if (reworkNote) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
-  const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(stage.maxTurns || 25)];
+  if (opts.resume) prompt = opts.prompt;
+  const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(opts.maxTurns || stage.maxTurns || 25)];
+  if (opts.resume) args.push('--resume', opts.resume);
   // Working outside HQ (e.g. a StudioControlRoom worktree): that checkout has no .claude/agents or
   // hooks, so pass the role definition and HQ's settings (pause hook, event logging) explicitly.
   if (cwd !== REPO) {
@@ -378,6 +382,40 @@ function sleepMs(ms, agentId) { // synchronous like the rest of the engine; wake
   for (let left = ms; left > 0 && !paused(agentId); left -= 60000) Atomics.wait(cell, 0, 0, Math.min(60000, left));
 }
 
+// ---- local model server check ----
+// 2026-11-11: Ollama was not running after a restart, so both local build attempts failed in seconds with
+// ECONNREFUSED and the stage fell through to Sonnet. A down server is not a failed attempt: check it first,
+// try to start it, wait for it, and only then give up on the local tier for this stage.
+const OLLAMA_WAIT_MS = Number(process.env.STUDIO_OLLAMA_WAIT_MS) || 5 * 60000;
+function ollamaUp(url) {
+  const r = spawnSync(process.execPath, ['-e', `fetch(${JSON.stringify(url + '/api/version')}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))`], { timeout: 10000 });
+  return r.status === 0;
+}
+function ensureLocalServer(agentId) {
+  let cfg = {}; try { cfg = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch {}
+  const url = (cfg.ollama && cfg.ollama.url) || 'http://127.0.0.1:11434';
+  if (ollamaUp(url)) return true;
+  console.log(`  ⚠ local model server ${url} is not answering; starting it and waiting up to ${Math.round(OLLAMA_WAIT_MS / 60000)} min`);
+  ev({ type: 'progress', agent: agentId, pct: 0, status: 'waiting', message: `local model server down; starting Ollama` });
+  try { require('child_process').spawn((cfg.ollama && cfg.ollama.exe) || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  for (let left = OLLAMA_WAIT_MS; left > 0 && !paused(agentId); left -= 5000) {
+    Atomics.wait(cell, 0, 0, 5000);
+    if (ollamaUp(url)) { console.log('  ✓ local model server is up'); return true; }
+  }
+  return false;
+}
+
+// ---- finalize turn ----
+// Local QA/review runs often spend every turn exploring and hit the turn cap before writing the report
+// (2026-11-07..11: no local HiveBoard QA attempt ever wrote one). Instead of discarding that work, resume the
+// same session for a few turns whose only job is to write the report from what it already found.
+const FINALIZE_TURNS = 8;
+const finalizePrompt = (stage, vars) => 'Your turn budget is used up. Do not explore or run anything else. ' +
+  `Using only what you have already found, write the required report now to: ${(stage.expect || []).map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}. ` +
+  'Mark anything you did not get to as UNVERIFIED. End the file with the required verdict line, then reply with a two-line summary.';
+const canFinalize = (stage, res) => !!(res.hitTurnCap && res.sessionId && stage.expect?.length && !mustChange(stage) && stage.finalizeOnCap !== false);
+
 // ---- reports written in the wrong place ----
 // Agents working in a lane worktree sometimes write an HQ report (docs/internal/review-*.md, QA reports) at
 // the same relative path inside the worktree. The check then sees it as missing and the stage climbs or blocks
@@ -457,7 +495,7 @@ function refreshStages(run) {
   return changed;
 }
 
-const hooks = { runAgent: (...a) => runAgent(...a), sleep: (ms, agentId) => sleepMs(ms, agentId) }; // test seams: selftests swap in fakes
+const hooks = { runAgent: (...a) => runAgent(...a), sleep: (ms, agentId) => sleepMs(ms, agentId), localReady: (agentId) => ensureLocalServer(agentId) }; // test seams: selftests swap in fakes
 
 // ---- the state machine ----
 // ---- postmortem stubs (S2) ----
@@ -572,15 +610,32 @@ function advance(run) {
     const ladder = LADDER[stage.tier || 'local'];
     let feedback = null, done = false, reworked = false;
     const reworkNote = run.reworkNotes && run.reworkNotes[stage.id];
+    let localDown = false;
     for (let attempt = 0; attempt < ladder.length && !done; attempt++) {
       const tierName = ladder[attempt];
       if (paused(stage.agent)) break;
+      if (TIERS[tierName].local && (localDown || !hooks.localReady(stage.agent))) {
+        if (paused(stage.agent)) break;
+        if (!localDown) {
+          localDown = true;
+          run.history.push({ stage: stage.id, type: 'local-down', tier: tierName, at: now(), note: 'local model server unreachable; skipped without counting an attempt' });
+          console.log(`  ⚠ local model server unreachable; skipping the local tier for ${stage.id}`);
+          save(run);
+        }
+        continue;
+      }
       if (['sonnet', 'opus'].includes(tierName)) writePostmortem(run, stage);
       ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
       const t0 = Date.now();
-      const res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
+      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
+      if (canFinalize(stage, res) && !paused(stage.agent)) {
+        console.log(`  ↻ hit the turn cap after ${res.turns ?? '?'} turns; finalize turn to write the report`);
+        const fin = hooks.runAgent(stage, tierName, vars, null, null, { resume: res.sessionId, prompt: finalizePrompt(stage, vars), maxTurns: FINALIZE_TURNS });
+        run.history.push({ stage: stage.id, type: 'finalize', tier: tierName, secs: fin.secs, turns: fin.turns, ok: !fin.error && !fin.hitTurnCap, at: now() });
+        res = { ...fin, secs: (res.secs || 0) + (fin.secs || 0), turns: (res.turns || 0) + (fin.turns || 0), finalized: true };
+      }
       if (res.usageLimit && !TIERS[tierName].local) {
         run.limitWaits = (run.limitWaits || 0) + 1;
         run.history.push({ stage: stage.id, type: 'usage-limit', tier: tierName, wait: run.limitWaits, at: now(), note: String(res.result || res.error || '').slice(0, 200) });

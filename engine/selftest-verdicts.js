@@ -10,6 +10,7 @@ const { spawnSync } = require('child_process');
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-verdicts-'));
 process.env.STUDIO_HOME = HOME;
 const engine = require('./engine.js');
+engine.hooks.localReady = () => true; // no real Ollama check in tests
 
 let fails = 0;
 const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) fails++; };
