@@ -2,7 +2,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, type StudioEvent, type StudioState, type Status } from './api';
 
-export interface AgentLive { status: Status; pct: number; task: string; lastTool?: string; since?: number; }
+export interface AgentLive { status: Status; pct: number; task: string; lastTool?: string; since?: number;
+  /** Model the agent's current (or last) engine stage runs on, e.g. 'qwen3.6:27b'. */
+  model?: string; tier?: string; cloud?: boolean; }
+
+const TIER_MODEL: Record<string, string> = { local: 'qwen3.6:27b', 'local-fast': 'qwen3-coder:30b', sonnet: 'sonnet', opus: 'opus', codex: 'codex' };
+/** Model for a start event: explicit fields (engine ≥ 2026-11-11), else the "[tier" tag in the task text. */
+export function modelOf(e: StudioEvent): { model?: string; tier?: string; cloud?: boolean } {
+  const tier = e.tier || (/\[(local-fast|local|sonnet|opus|codex)\b/.exec(e.task || '') || [])[1];
+  const model = e.model || (tier ? TIER_MODEL[tier] : undefined);
+  if (!model) return {};
+  return { model, tier, cloud: e.cloud ?? !(tier === 'local' || tier === 'local-fast') };
+}
 
 export function useStudio() {
   const [state, setState] = useState<StudioState | null>(null);
@@ -37,7 +48,7 @@ export function deriveLive(events: StudioEvent[]): Record<string, AgentLive> {
     if (!e.agent) continue;
     const a = get(e.agent);
     switch (e.type) {
-      case 'start': Object.assign(a, { status: 'working', pct: 5, task: e.task || '', since: e.ts, lastTool: undefined }); break;
+      case 'start': Object.assign(a, { status: 'working', pct: 5, task: e.task || '', since: e.ts, lastTool: undefined, model: undefined, tier: undefined, cloud: undefined }, modelOf(e)); break;
       case 'tool': a.status = 'working'; a.lastTool = `${e.tool} ${e.detail || ''}`.trim(); a.pct = Math.min(90, a.pct + 3); break;
       case 'progress': a.pct = e.pct ?? a.pct; a.status = e.status || 'working'; if (e.message) a.task = e.message; break;
       case 'done': if (a.status !== 'blocked' && a.status !== 'paused') { a.status = 'done'; a.pct = 100; } break;

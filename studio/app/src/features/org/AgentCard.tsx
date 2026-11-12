@@ -43,6 +43,18 @@ export function StatusPill({ status }: { status: string }) {
   return <span className="o-pill" style={{ ['--st' as string]: STATUS_VAR[status] || 'var(--idle)' }}><i />{status}</span>;
 }
 
+/** The model this employee is using right now (bright, pulsing while working; dim "last" when idle). */
+export function LiveModel({ live }: { live?: AgentLive }) {
+  if (!live?.model) return null;
+  const on = live.status === 'working';
+  const kind = live.cloud ? 'cloud' : 'local';
+  return (
+    <span className={'o-live ' + kind + (on ? ' on' : '')} title={(on ? 'Using now: ' : 'Last used: ') + live.model + (live.cloud ? ' (cloud)' : ' (local GPU)')}>
+      <i />{on ? '' : 'last: '}{live.model}<em>{live.cloud ? 'cloud' : 'local'}</em>
+    </span>
+  );
+}
+
 export function ModelChips({ info }: { info?: ModelInfo }) {
   if (!info || (!info.brain && !info.local?.length)) return null;
   return (
@@ -83,6 +95,7 @@ export function AgentCard({ id, c, team, live, models, head, onOpen }: CardProps
           <strong className="o-name">{name}</strong>
           <span className="o-title">{title}</span>
           <StatusPill status={status} />
+          <LiveModel live={live} />
         </div>
       </div>
       <p className="o-task">{live?.task || <em>No active task</em>}</p>
