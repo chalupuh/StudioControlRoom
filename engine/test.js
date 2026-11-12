@@ -13,6 +13,8 @@ const SUITES = [
   { file: 'selftest-mustchange.js',   label: 'build stages must change files' },
   { file: 'selftest-rework.js',       label: 'QA/review rework loop' },
   { file: 'selftest-stage-contracts.js',   label: 'requires / dod stage contracts' },
+  { file: 'selftest-auth.js',             label: 'auth: token, rate-limit, IP restriction' },
+  { file: 'selftest-pair.js',             label: 'pairing: QR encoder, pair command, /api/pair-qr' },
   { file: 'selftest-verdicts.js',     label: 'rework target, CLI error results, bold verdicts' },
   { file: 'selftest-filepath.js',     label: '/api/file path resolution (gate links)' },
   { file: 'selftest-local-env.js',    label: 'local tier context window env' },
