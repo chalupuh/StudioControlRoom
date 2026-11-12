@@ -24,6 +24,10 @@ const SUITES = [
   { file: 'selftest-local-env.js',    label: 'local tier context window env' },
   { file: 'selftest-finalize.js',     label: 'finalize turn on turn cap, local server check' },
   { file: 'selftest-recurring.js',    label: 'usage-limit waits, misplaced reports, stale rules, headless permissions' },
+  { file: 'selftest-codex.js',        label: 'codex tier (fake codex on PATH)' },
+  { file: '../bench/bench-providers.test.js', label: 'bench provider routing' },
+  { file: '../tools/sync-codex-agents.test.js', label: 'sync-codex-agents / check-config' },
+  { file: '../studio/usage.test.js', label: 'usage reducer (provider split)' },
 ];
 
 let anyFailed = false;

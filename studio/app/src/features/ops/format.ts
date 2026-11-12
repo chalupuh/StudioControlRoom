@@ -1,5 +1,5 @@
 // Pure helpers for the ops view.
-import type { RunSummary } from '../../api';
+import type { RunSummary, Provider, ProviderUsage } from '../../api';
 
 export function fmtDuration(ms: number): string {
   if (!isFinite(ms) || ms < 0) return '–';
@@ -18,7 +18,15 @@ export function fmtTokens(n: number): string {
   return String(Math.round(n));
 }
 
-export const isCloudTier = (t?: string) => t === 'opus' || t === 'sonnet';
+export const PROVIDER_LABEL: Record<string, string> = { ollama: 'Ollama (local)', anthropic: 'Anthropic (Claude)', openai: 'OpenAI (Codex)' };
+
+/** Rows for the provider table: known providers first in fixed order, empty ones dropped. */
+export function providerRows(by: Partial<Record<Provider, ProviderUsage>> | undefined) {
+  const order: Provider[] = ['ollama', 'anthropic', 'openai'];
+  return order.filter((p) => by && by[p]).map((p) => ({ id: p, label: PROVIDER_LABEL[p], ...by![p]! }));
+}
+
+export const isCloudTier = (t?: string) => t === 'opus' || t === 'sonnet' || t === 'codex';
 
 /** Budget gauge level: ok < 80%, warn >= 80%, over >= 100%. */
 export function budgetLevel(used: number, budget: number): 'ok' | 'warn' | 'over' {
