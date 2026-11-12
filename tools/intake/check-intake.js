@@ -49,6 +49,10 @@ function parseSections(body) {
   return out;
 }
 
+// Domain labels must start with a letter and end in an alphabetic TLD, so icon@2x.png, pkg@1.2.3
+// and git@github.com:org/repo (ssh remote) are not treated as emails.
+const EMAIL_RE = /[\w.+-]+(?<!\bgit)@[A-Za-z][A-Za-z0-9-]*(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b/;
+
 const stripComments = (s) => s.replace(/<!--[\s\S]*?-->/g, '').trim();
 
 function checkIntake(markdown) {
@@ -95,7 +99,7 @@ function checkIntake(markdown) {
     }
   }
 
-  if (/[\w.+-]+@[\w-]+\.[\w.-]+/.test(body)) problems.push('remove submitter email');
+  if (EMAIL_RE.test(body)) problems.push('remove submitter email');
 
   return { ok: problems.length === 0, problems, meta: out };
 }

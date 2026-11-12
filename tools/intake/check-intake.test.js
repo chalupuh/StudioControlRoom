@@ -74,3 +74,12 @@ test('email is rejected', () => {
 test('missing front matter fails', () => {
   assert.strictEqual(checkIntake('## Problem\nx').ok, false);
 });
+
+test('email-like tokens that are not emails pass', () => {
+  for (const t of ['icon@2x.png', 'pkg@1.2.3', 'git@github.com:o/r']) {
+    const r = checkIntake(fixture({ extra: `See ${t}` }));
+    assert.ok(!r.problems.includes('remove submitter email'), t);
+  }
+  const bad = checkIntake(fixture({ extra: 'jane.doe@mail.co' }));
+  assert.ok(bad.problems.includes('remove submitter email'));
+});
