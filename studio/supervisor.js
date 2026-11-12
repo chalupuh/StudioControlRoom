@@ -17,7 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const { TEAMS, TEAM_FALLBACK, teamOf, teamPaused } = require('./teams');
+const { teamOf, teamPaused } = require('./teams');
 
 const INTERVAL_MS = 60000;
 const MAX_LOG = 5 * 1024 * 1024;
@@ -268,7 +268,9 @@ function tick(ctx, deps = {}) {
 
     // No engine process for this run: settle how long the last resumed engine lived, then apply the guard.
     const cursor = run.cursor || 0;
-    settleResumes(lock);
+    // A failed process scan (null) cannot tell a live resumed engine from a dead one: settle only after takeLock succeeds.
+    const scanOk = !!studioProcs;
+    if (scanOk) settleResumes(lock);
     const guard = crashLoopGuard(lock, cursor);
     if (guard.blocked) {
       log(`run ${id}: crash-loop blocked (${guard.reason})`);
@@ -283,6 +285,7 @@ function tick(ctx, deps = {}) {
     }
 
     if (!takeLock(lock, deps)) { log(`run ${id}: locked by a live process, skipping`); result.skipped.push(id); continue; }
+    if (!scanOk) settleResumes(lock);
     try {
       const r = deps.spawnEngine(HOME, id, ctx);
       const pid = pidOf(r);
@@ -382,6 +385,6 @@ function dailyBackup(ctx, log, opts = {}) {
 }
 
 module.exports = {
-  tick, supervise, makeLogger, takeLock, releaseLock, INTERVAL_MS, dailyBackup, teamOf, teamPaused, crashLoopGuard,
-  recordResume, settleResumes, TEAM_FALLBACK, TEAMS, spawnEngine, resumeRun, enginePid, engineAlive, alive,
+  tick, supervise, makeLogger, takeLock, releaseLock, INTERVAL_MS, dailyBackup, crashLoopGuard,
+  recordResume, settleResumes, spawnEngine, resumeRun, enginePid, engineAlive, alive,
 };

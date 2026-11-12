@@ -231,21 +231,9 @@ function verifyToken(provided) {
 }
 
 // ---- LAN bind address ----
-// Read machine.json profile (HOME/.studio/machine.json).
-// TODO(lane merge): Lane H's studio/machine.js loads the same file (with defaults + bad-JSON warning).
-// When the lanes merge, replace readMachineConfig/getLanBind with require('./machine').load().controlRoom.bind.
-function readMachineConfig() {
-  try { return JSON.parse(fs.readFileSync(path.join(DIR, 'machine.json'), 'utf8')); } catch { return {}; }
-}
-
 function getLanBind() {
-  // 1. STUDIO_BIND env var
-  if (process.env.STUDIO_BIND) return process.env.STUDIO_BIND;
-  // 2. machine.json controlRoom.bind
-  const mc = readMachineConfig();
-  if (mc.controlRoom && mc.controlRoom.bind) return mc.controlRoom.bind;
-  // 3. default: loopback only
-  return '127.0.0.1';
+  // 1. STUDIO_BIND env var, 2. machine.json controlRoom.bind (via machine.js defaults), 3. loopback only
+  return process.env.STUDIO_BIND || MACHINE.controlRoom.bind || '127.0.0.1';
 }
 
 // ---- Pairing (phone on the LAN) ----
@@ -645,7 +633,7 @@ else if (cmd === 'supervise') { const h = studioHome(true); require('./superviso
 else if (cmd === 'backup') {
   const h = studioHome(true);
   const { backup } = require('./backup');
-  backup({ HOME: h }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } }).catch((e) => { console.error(e); process.exit(1); });
+  backup({ HOME: h }).then((dest) => { if (!dest) { console.error('backup: nothing to back up'); process.exit(1); } console.log('backup written: ' + dest); }).catch((e) => { console.error(e); process.exit(1); });
 }
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
 else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | supervise | backup | token [rotate] | pair [port]');

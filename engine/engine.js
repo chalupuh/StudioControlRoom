@@ -389,12 +389,11 @@ function ollamaUp(url) {
   return r.status === 0;
 }
 function ensureLocalServer(agentId) {
-  let cfg = {}; try { cfg = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch {}
-  const url = (cfg.ollama && cfg.ollama.url) || 'http://127.0.0.1:11434';
+  const url = machineLib.ollamaUrl(MACHINE);
   if (ollamaUp(url)) return true;
   console.log(`  ⚠ local model server ${url} is not answering; starting it and waiting up to ${Math.round(OLLAMA_WAIT_MS / 60000)} min`);
   ev({ type: 'progress', agent: agentId, pct: 0, status: 'waiting', message: `local model server down; starting Ollama` });
-  try { require('child_process').spawn((cfg.ollama && cfg.ollama.exe) || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
+  try { require('child_process').spawn(MACHINE.ollama.exe || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
   const cell = new Int32Array(new SharedArrayBuffer(4));
   for (let left = OLLAMA_WAIT_MS; left > 0 && !paused(agentId); left -= 5000) {
     Atomics.wait(cell, 0, 0, 5000);
