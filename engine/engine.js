@@ -473,31 +473,124 @@ const reworkExcludes = (rec, target, vars) => [rec.report, rec.verdictReport, pa
 // On main or in HQ the engine/owner own git, so any scoped change vs the baseline is enough.
 const requiresCommit = (dir) => !!dir && dir !== REPO && !['main', 'master'].includes(currentBranch(dir));
 
-// Findings checklist extracted from a rejected report: bullets/headings that carry a severity word, a file:line
-// reference, or sit under a severity heading. IDs are explicit ones in the report ("B1", "F-2", "#3") or F1, F2...
+// Findings checklist extracted from a rejected report. Recognised, in this order of trust:
+//  1. finding IDs (B-1, S2, N-9, F36, R3, optional letter suffix) as a heading, a bold lead-in or a bullet lead-in,
+//     whether or not the line carries a severity word or a file:line;
+//  2. status-table rows ("| B-1 | **STILL FAILING** | ..."): STILL FAILING / FAIL / OPEN / UNVERIFIED are kept,
+//     FIXED ones are dropped (also from the list when a prose mention of the same ID exists);
+//  3. legacy: bullets/headings that carry a severity word, a file:line, or sit under a severity heading.
+// The result is ordered Blockers, then Should-fix, then the rest (stable).
 const SEVERITY_RX = /\b(blockers?|should[- ]fix|nits?|critical|major|minor|high|medium|low)\b/i;
-const FILEREF_RX = /[\w./\\-]+\.\w{1,6}:\d+/;
+const FILEREF_RX = /[\w./\\[\]-]+\.\w{1,6}:\d+/;
+const ID_RX = /^([BSNFR]-?\d{1,3}[a-z]?)(?![\w/=-])/;
+const OPEN_STATUS_RX = /^(?:NOT FIXED|STILL FAILING|STILL OPEN|FAILING|FAILED|FAIL|OPEN|UNVERIFIED)\b/i;
+const FIXED_STATUS_RX = /^FIXED\b/i;
+const MD_LEAD = /^(?:\*\*|__|`)+/;
+const normSev = (s) => { const t = String(s || '').toLowerCase().replace(/[-\s]+/g, ' ').trim(); if (/^blocker/.test(t)) return 'blocker'; if (/^nit/.test(t)) return 'nit'; return t || null; };
+const idSeverity = (id) => ({ B: 'blocker', S: 'should fix', N: 'nit' })[id[0]] || null;
+const sevRank = (s) => (s === 'blocker' || s === 'critical' ? 0 : s === 'should fix' || s === 'major' || s === 'high' ? 1 : 2);
+const stripMd = (s) => String(s || '').replace(/[*`_]/g, '').replace(/\s+/g, ' ').trim();
+const idKey = (id) => id.replace(/^([A-Z])-?(\d)/, '$1-$2').toLowerCase();
+const clean = (s) => String(s || '').replace(/\*\*|__/g, '').replace(/\s+/g, ' ').trim().slice(0, 300);
+// Lead-in ID of a heading / bold / bullet line: { id, rest } or null. Plain (unbolded) bullets need a real separator,
+// so prose like "- B-1 is still the main issue" is not a new finding; "F1-F18", "S-1..S-7" and "F19 = AC-72" never match.
+function leadId(line) {
+  let s = line; let heading = false;
+  const h = /^#{1,6}\s+(.*)$/.exec(s); if (h) { s = h[1]; heading = true; }
+  else { const b = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(s); if (b) s = b[1]; }
+  const bold = MD_LEAD.test(s);
+  s = s.replace(MD_LEAD, '');
+  const m = ID_RX.exec(s); if (!m) return null;
+  let rest = s.slice(m[0].length).replace(/^\s*\([^)]*\)/, '');
+  if (/^\s*=/.test(rest) || /^\s*\.\./.test(rest)) return null;
+  const sep = /^((?:\*\*|__|`)*)(\s*[.:—–]\s*|\s+-\s+|\s+|$)/.exec(rest);
+  if (!sep) return null;
+  if (!heading && !bold && !sep[1] && !/[.:—–-]/.test(sep[2])) return null;
+  rest = rest.slice(sep[0].length).replace(/(?:\*\*|__)\s*$/, '').trim();
+  const id = m[1];
+  if (FIXED_STATUS_RX.test(rest)) return { id, fixed: true, rest };
+  if (rest.length < 6) return null;
+  return { id, rest };
+}
+function tableFinding(line) {
+  const cells = line.replace(/^\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+  const idm = ID_RX.exec(stripMd(cells[0]));
+  if (!idm || cells.length < 2) return null;
+  const si = cells.findIndex((c, i) => i > 0 && (OPEN_STATUS_RX.test(stripMd(c)) || FIXED_STATUS_RX.test(stripMd(c))));
+  if (si < 0) return null;
+  const st = stripMd(cells[si]);
+  const rest = cells.filter((c, i) => i > 0 && i !== si).map(stripMd).filter(Boolean).join(' - ');
+  return { id: idm[1], fixed: !OPEN_STATUS_RX.test(st), status: st.split(/[;(:,]/)[0].trim().toUpperCase(), rest, ref: (FILEREF_RX.exec(cells.join(' ')) || [])[0] || null };
+}
 function extractFindings(txt) {
-  const out = []; let section = null;
+  const items = []; const fixed = new Set(); const openTable = new Set(); let section = null, cur = null;
+  const add = (f) => { const o = items.find((x) => x.id && idKey(x.id) === idKey(f.id)); if (!o) items.push(f); else if (!o.ref && f.ref) o.ref = f.ref; return o || f; };
   for (const raw of String(txt || '').split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || (/VERDICT|REQUEST CHANGES|^APPROVE/i.test(line) && line.length < 60)) continue;
+    if (line[0] === '|') {
+      cur = null;
+      const t = tableFinding(line); if (!t) continue;
+      if (t.fixed) { fixed.add(idKey(t.id)); continue; }
+      openTable.add(idKey(t.id));
+      add({ id: t.id, severity: idSeverity(t.id) || section, ref: t.ref, text: `[${t.status}] ${t.rest}`.slice(0, 300) });
+      continue;
+    }
     const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    const lead = leadId(line);
+    if (lead) {
+      cur = null;
+      if (lead.fixed) { fixed.add(idKey(lead.id)); continue; }
+      const sm = SEVERITY_RX.exec(lead.rest);
+      cur = add({ id: lead.id, severity: idSeverity(lead.id) || (sm ? normSev(sm[1]) : section), ref: (FILEREF_RX.exec(lead.rest) || [])[0] || null, text: clean(lead.rest) });
+      continue;
+    }
+    if (heading) cur = null;
+    if (cur) { if (!cur.ref) { const r = FILEREF_RX.exec(line); if (r) cur.ref = r[0]; } continue; } // body of an ID'd finding
     const bullet = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
-    if (heading && SEVERITY_RX.test(heading[1]) && heading[1].length < 50 && !FILEREF_RX.test(heading[1])) { section = (SEVERITY_RX.exec(heading[1]) || [])[1]; continue; }
+    if (heading && SEVERITY_RX.test(heading[1]) && heading[1].length < 50 && !FILEREF_RX.test(heading[1])) { section = normSev((SEVERITY_RX.exec(heading[1]) || [])[1]); continue; }
     if (heading) { if (!SEVERITY_RX.test(heading[1])) section = null; if (!FILEREF_RX.test(heading[1])) continue; }
     const body = (heading || bullet || [])[1];
     if (!body || body.length < 12) continue;
     const ref = (FILEREF_RX.exec(body) || [])[0] || null;
-    const sev = (SEVERITY_RX.exec(body) || [])[1] || section;
+    const sev = normSev((SEVERITY_RX.exec(body) || [])[1]) || section;
     if (!ref && !sev) continue;
     const idm = /^\W{0,2}((?:[A-Z]{1,3}[-.]?\d{1,3})|#\d{1,3})\b/.exec(body);
-    out.push({ id: idm ? idm[1].replace(/^#/, 'F') : `F${out.length + 1}`, severity: sev ? sev.toLowerCase().replace(/[- ]/g, ' ') : null, ref, text: body.replace(/\s+/g, ' ').slice(0, 300) });
-    if (out.length >= 40) break;
+    items.push({ id: idm ? idm[1].replace(/^#/, 'F') : null, severity: sev, ref, text: clean(body) });
+    if (items.length >= 200) break;
   }
-  // explicit IDs must be unique; fall back to positional ones on a clash
-  if (new Set(out.map((f) => f.id)).size !== out.length) out.forEach((f, i) => { f.id = `F${i + 1}`; });
-  return out;
+  // drop repeats of an ID, and anything marked FIXED (unless a status table also lists it as still open)
+  const seen = new Set(); const kept = [];
+  for (const f of items) {
+    if (f.id) { const k = idKey(f.id); if (seen.has(k)) continue; seen.add(k); if (fixed.has(k) && !openTable.has(k)) continue; }
+    kept.push(f);
+  }
+  // findings without an explicit ID get the next free F<n>
+  let n = 0; const used = new Set([...kept.map((f) => f.id).filter(Boolean), ...[...fixed, ...seen].map((k) => k.replace('-', '').toUpperCase())]);
+  for (const f of kept) if (!f.id) { do n++; while (used.has(`F${n}`)); f.id = `F${n}`; used.add(f.id); }
+  kept.forEach((f, i) => { f.i = i; });
+  kept.sort((a, b) => sevRank(a.severity) - sevRank(b.severity) || a.i - b.i);
+  return kept.slice(0, 40).map(({ id, severity, ref, text }) => ({ id, severity: severity || null, ref, text }));
+}
+// Blockers (and Should-fix) sections verbatim: used when the report has a non-empty Blockers section but no blocker
+// reached the checklist, so blockers can never silently drop. Returns '' when no fallback is needed.
+function findingsFallback(txt, findings) {
+  if ((findings || []).some((f) => f.severity === 'blocker')) return '';
+  const secs = { blocker: [], should: [] }; let cur = null;
+  for (const raw of String(txt || '').split(/\r?\n/)) {
+    const h = /^#{1,6}\s+(.*)$/.exec(raw.trim());
+    if (h) {
+      const t = stripMd(h[1]);
+      cur = /^blockers?\b/i.test(t) && t.length < 50 ? 'blocker' : /^should[- ]fix\b/i.test(t) && t.length < 50 ? 'should' : null;
+      if (cur) secs[cur].push(raw);
+      continue;
+    }
+    if (cur) secs[cur].push(raw);
+  }
+  const content = secs.blocker.slice(1).map((l) => l.trim()).filter((l) => l && l !== '---');
+  if (!content.length || content.every((l) => /^(?:[-*]\s*)?(?:\*\*)?(?:none|n\/a|no blockers?)\b/i.test(l))) return '';
+  const body = [...secs.blocker, ...secs.should].join('\n').trim();
+  return body.length > 6000 ? body.slice(0, 6000) + '\n[... truncated; read the full report]' : body;
 }
 const reworkRecords = (run) => (run.reworkRecords = run.reworkRecords || []);
 const activeRecord = (run, target, status) => [...reworkRecords(run)].reverse().find((r) => r.target === target && r.status === status) || null;
@@ -509,7 +602,9 @@ function reworkPrompt(rec, dir) {
     ? rec.findings.map((f) => `  ${f.id}${f.severity ? ` [${f.severity}]` : ''}${f.ref ? ` ${f.ref}` : ''}: ${f.text}`).join('\n')
     : '  (no individual findings could be extracted; read the report and fix every finding in it)';
   return `REWORK round ${rec.round}/${rec.max}. ${rec.rejectedBy} rejected the work. Full report (read it): ${rec.report} (sha256 ${short(rec.reportSha256)}).\n` +
-    `Findings checklist:\n${list}\n` +
+    `Findings checklist (blockers first):\n${list}\n` +
+    (rec.findingsFallback ? `The report has a Blockers section but no blocker could be extracted into the checklist. These sections are copied verbatim; every item in them is mandatory:\n${rec.findingsFallback}\n` : '') +
+    'Fix blockers first; fix nits only after all blockers and should-fix items are done.\n' +
     (rec.baseline ? `Baseline at rejection: HEAD ${short(rec.baseline.head)}. The engine rejects this rework unless the tree differs from that baseline${commit ? ' AND you commit (HEAD must advance)' : ''}.\n` : '') +
     'Order of work: 1) make the edits for the checklist FIRST (no broad exploration); 2) ' + (commit ? 'commit; 3) ' : '') +
     'only then run the tests. Do not re-implement the original task or touch unrelated code. ' +
@@ -631,9 +726,10 @@ function handleRework(run, stage, vars, res, t0) {
   // Persistent, auditable record (cause 4): report path + sha256, baseline, extracted findings. It is marked
   // consumed when the rejecting stage finally passes, never deleted.
   for (const old of reworkRecords(run)) if (old.target === back.id && ['pending', 'built'].includes(old.status)) old.status = 'superseded';
+  const foundFindings = extractFindings(txt);
   const rec = {
     id: `${stage.id}:${n}`, round: n, max, rejectedBy: stage.id, target: back.id, status: 'pending', at: now(),
-    report: toSlash(kept), reportSha256: sha256(txt), findings: extractFindings(txt),
+    report: toSlash(kept), reportSha256: sha256(txt), findings: foundFindings, findingsFallback: findingsFallback(txt, foundFindings),
     baseline: gitState(workdir(vars)), verdictReport: toSlash(rp),
   };
   reworkRecords(run).push(rec);
@@ -1047,4 +1143,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { gitState, changedSince, extractFindings, reworkPrompt, CONTEXT_LIMIT_RX, advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, parseCodexOutput, runCodex, findCodex, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { gitState, changedSince, extractFindings, findingsFallback, reworkPrompt, CONTEXT_LIMIT_RX, advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, parseCodexOutput, runCodex, findCodex, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
