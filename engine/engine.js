@@ -17,7 +17,8 @@
 //   so an honest 'VERDICT: FAIL' loops back to the build stage (same foreach item) instead of climbing tiers.
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const crypto = require('crypto');
+const { spawnSync, execFileSync } = require('child_process');
 const codexPath = require('./codex-path.js');
 
 // REPO = the org workspace (STUDIO_HOME): agents, docs, pipelines, runtime data. The engine itself may live
@@ -258,11 +259,23 @@ const load = (id) => JSON.parse(fs.readFileSync(runFile(id), 'utf8'));
 // A partial success (hasFailure but hasResult) does NOT report an error.
 // The [claude-code:unrecognized_model] stderr warning is logged to ignoredWarning for
 // observability but NEVER suppresses an error — real failures must still be reported.
-const isCliErrorResult = (result) => {
+// Known context-window / output-limit failures of Claude Code and Ollama. A rework that "succeeds" with one of
+// these as its answer changed nothing (S4h history held ok:true for "exceeded the 32000 output token maximum"),
+// so they are hard failures before any verification. Short, error-sized texts only.
+const CONTEXT_LIMIT_RX = new RegExp([
+  'exceeded the \\d+ output token maximum', 'output token (?:limit|maximum)', 'prompt is too long', 'prompt too long',
+  'context (?:length|window|limit)[^.]{0,40}(?:exceed|reached|too (?:long|large))', '(?:exceed|exceeds|exceeded)[^.]{0,40}context (?:length|window|limit)',
+  'maximum context length', 'input length and `?max_tokens`? exceed', 'request too large', 'request_too_large', 'context_length_exceeded',
+  'conversation is too long', 'ran out of context',
+].join('|'), 'i');
+const OUTPUT_MAX_RX = /exceeded the \d+ output token maximum/i; // seen with ok:true in S4h history: unconditional
+// `failed` = the run itself failed (is_error / non-zero exit); the broader phrases only count then, so an honest
+// short summary that mentions "prompt too long" is not misread.
+const isCliErrorResult = (result, failed = false) => {
   const t = String(result || '').trim();
-  // The token-limit phrase only counts in a short, error-sized result, so a long real report that merely
-  // mentions it (e.g. a review of this very check) is not misread as a failure.
-  return /^API Error:/i.test(t) || (t.length < 500 && /exceeded the \d+ output token maximum/i.test(t));
+  // The limit phrases only count in a short, error-sized result, so a long real report that merely
+  // mentions one (e.g. a review of this very check) is not misread as a failure.
+  return /^API Error:/i.test(t) || (t.length < 500 && (OUTPUT_MAX_RX.test(t) || (failed && CONTEXT_LIMIT_RX.test(t))));
 };
 // A plan usage/rate limit ("You've hit your 5-hour limit · resets 4am") is not a failure of the stage: the
 // engine waits for the reset and retries the same tier (2026-11-09: every run blocked at ~2 AM on this).
@@ -286,7 +299,7 @@ function parseRunOutput(r) {
   // A CLI/API error printed as the "result" (e.g. "API Error: ... exceeded the 32000 output token maximum")
   // is not an answer: report it as an error so the attempt fails and climbs the tier ladder.
   // (is_error with a real result stays a partial success by design; see selftest.js.)
-  const cliError = isCliErrorResult(out.result);
+  const cliError = isCliErrorResult(out.result, !!hasFailure);
   return {
     turns: out.num_turns,
     result: String(out.result || '').slice(0, 2000),
@@ -371,13 +384,14 @@ function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
     if (found) env.CLAUDE_CODE_GIT_BASH_PATH = found;
   }
   if (tier.local) Object.assign(env, localTierEnv(tier, machineCfg));
-  let prompt = fill(stage.task, vars);
   const cwd = workdir(vars);
+  // Rework builders get a short, dedicated prompt (checklist first; the original task only as brief context).
+  let prompt = opts.rework && reworkNote ? `${reworkNote}\n\nOriginal task, for context only (do NOT redo it):\n${fill(stage.task, vars).slice(0, 700)}` : fill(stage.task, vars);
   prompt += studioRules(stage, cwd);
   prompt += `
 ${unattendedRules(stage, cwd)}`;
   if (stage.expect?.length) prompt += `\nYou MUST create/update these files at exactly these absolute paths (not inside ${cwd} unless the path says so): ${stage.expect.map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}.`;
-  if (reworkNote) prompt += `\n\n${reworkNote}`;
+  if (reworkNote && !opts.rework) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
   if (opts.resume) prompt = opts.prompt;
   const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(opts.maxTurns || stage.maxTurns || 25)];
@@ -410,11 +424,103 @@ ${unattendedRules(stage, cwd)}`;
 function treeSnapshot(dir) {
   try {
     const git = (a) => require('child_process').execFileSync('git', a, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return git(['rev-parse', 'HEAD']) + git(['status', '--porcelain']) + git(['diff']);
+    return git(['rev-parse', 'HEAD']) + git(['status', '--porcelain', '-uall']) + git(['diff']);
   } catch { return null; }
 }
 // Stages that must produce changes: explicit "mustChange": true, or any stage whose id starts with "build".
 const mustChange = (stage) => stage.mustChange ?? /^build/.test(stage.id || '');
+
+// ---- rework baseline (rework-loop diagnosis causes 1-2) ----
+// On a QA/review rejection the engine records what the tree looked like (HEAD, porcelain status, diff hash, and a
+// content hash of every dirty/untracked file). A rework builder only succeeds if the tree differs from THAT
+// baseline, not merely from its own start, and QA/review after the rework is only run on a non-empty manifest of
+// the paths that changed since the baseline.
+const sha256 = (data) => crypto.createHash('sha256').update(data).digest('hex');
+function gitOut(dir, args) {
+  try { return execFileSync('git', ['-c', 'core.quotepath=off', ...args], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }); } catch { return null; }
+}
+const lines = (s) => String(s || '').split(/\r?\n/).filter(Boolean);
+const fileHash = (dir, rel) => { try { return sha256(fs.readFileSync(path.join(dir, rel))); } catch { return 'deleted'; } };
+const IGNORED_PATH = /^(?:\.studio|node_modules|\.git)\//;
+// Paths that differ from `rev`: tracked changes (committed since or uncommitted) plus untracked files.
+function dirtyPaths(dir, rev) {
+  const tracked = gitOut(dir, ['diff', '--name-only', '--relative', rev]);
+  const untracked = gitOut(dir, ['ls-files', '--others', '--exclude-standard']);
+  return [...new Set([...lines(tracked), ...lines(untracked)])].filter((p) => !IGNORED_PATH.test(p));
+}
+// null when `dir` is not a git checkout (or has no commit): the rework checks are then skipped, as treeSnapshot's are.
+function gitState(dir) {
+  const head = gitOut(dir, ['rev-parse', 'HEAD']);
+  if (head === null) return null;
+  const sha = head.trim();
+  const diff = gitOut(dir, ['diff', 'HEAD']) || '';
+  const files = Object.fromEntries(dirtyPaths(dir, sha).map((p) => [p, fileHash(dir, p)]));
+  return { head: sha, porcelain: gitOut(dir, ['status', '--porcelain', '-uall']) || '', diffHash: sha256(diff), files };
+}
+// Paths whose content differs from the baseline, committed or not. `exclude` = absolute paths (reports) to ignore.
+function changedSince(baseline, dir, exclude = [], only = null) {
+  if (!baseline) return null;
+  const pre = (only || []).map((x) => toSlash(x).replace(/\/?$/, '/'));
+  const ex = new Set(exclude.map((e) => toSlash(path.relative(dir, e))));
+  const cand = new Set([...dirtyPaths(dir, baseline.head), ...Object.keys(baseline.files || {})]);
+  return [...cand].filter((p) => !ex.has(p) && !IGNORED_PATH.test(p) && (!pre.length || pre.some((x) => p.startsWith(x))) && (baseline.files && p in baseline.files ? baseline.files[p] !== fileHash(dir, p) : true)).sort();
+}
+// Paths that are the stage's own output, not a fix: its expect files and the shared sprint log (and the rejected
+// report). Without this, writing the sprint log (or another lane's report in HQ) would count as "changed".
+const reworkExcludes = (rec, target, vars) => [rec.report, rec.verdictReport, path.join(REPO, 'docs', 'internal', 'sprint-log.md'),
+  ...((target && target.expect) || []).map((e) => path.resolve(REPO, fill(e, vars)))].map((p) => path.resolve(p));
+// Commit policy: a rework in a lane worktree (not HQ, not main/master) must commit, so HEAD has to advance.
+// On main or in HQ the engine/owner own git, so any scoped change vs the baseline is enough.
+const requiresCommit = (dir) => !!dir && dir !== REPO && !['main', 'master'].includes(currentBranch(dir));
+
+// Findings checklist extracted from a rejected report: bullets/headings that carry a severity word, a file:line
+// reference, or sit under a severity heading. IDs are explicit ones in the report ("B1", "F-2", "#3") or F1, F2...
+const SEVERITY_RX = /\b(blockers?|should[- ]fix|nits?|critical|major|minor|high|medium|low)\b/i;
+const FILEREF_RX = /[\w./\\-]+\.\w{1,6}:\d+/;
+function extractFindings(txt) {
+  const out = []; let section = null;
+  for (const raw of String(txt || '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || (/VERDICT|REQUEST CHANGES|^APPROVE/i.test(line) && line.length < 60)) continue;
+    const heading = /^#{1,6}\s+(.*)$/.exec(line);
+    const bullet = /^(?:[-*+]|\d+[.)])\s+(.*)$/.exec(line);
+    if (heading && SEVERITY_RX.test(heading[1]) && heading[1].length < 50 && !FILEREF_RX.test(heading[1])) { section = (SEVERITY_RX.exec(heading[1]) || [])[1]; continue; }
+    if (heading) { if (!SEVERITY_RX.test(heading[1])) section = null; if (!FILEREF_RX.test(heading[1])) continue; }
+    const body = (heading || bullet || [])[1];
+    if (!body || body.length < 12) continue;
+    const ref = (FILEREF_RX.exec(body) || [])[0] || null;
+    const sev = (SEVERITY_RX.exec(body) || [])[1] || section;
+    if (!ref && !sev) continue;
+    const idm = /^\W{0,2}((?:[A-Z]{1,3}[-.]?\d{1,3})|#\d{1,3})\b/.exec(body);
+    out.push({ id: idm ? idm[1].replace(/^#/, 'F') : `F${out.length + 1}`, severity: sev ? sev.toLowerCase().replace(/[- ]/g, ' ') : null, ref, text: body.replace(/\s+/g, ' ').slice(0, 300) });
+    if (out.length >= 40) break;
+  }
+  // explicit IDs must be unique; fall back to positional ones on a clash
+  if (new Set(out.map((f) => f.id)).size !== out.length) out.forEach((f, i) => { f.id = `F${i + 1}`; });
+  return out;
+}
+const reworkRecords = (run) => (run.reworkRecords = run.reworkRecords || []);
+const activeRecord = (run, target, status) => [...reworkRecords(run)].reverse().find((r) => r.target === target && r.status === status) || null;
+const short = (sha) => String(sha || '').slice(0, 9);
+// The dedicated, short rework prompt (cause 5): checklist first, edits before tests, report per finding ID.
+function reworkPrompt(rec, dir) {
+  const commit = rec.baseline && requiresCommit(dir);
+  const list = rec.findings.length
+    ? rec.findings.map((f) => `  ${f.id}${f.severity ? ` [${f.severity}]` : ''}${f.ref ? ` ${f.ref}` : ''}: ${f.text}`).join('\n')
+    : '  (no individual findings could be extracted; read the report and fix every finding in it)';
+  return `REWORK round ${rec.round}/${rec.max}. ${rec.rejectedBy} rejected the work. Full report (read it): ${rec.report} (sha256 ${short(rec.reportSha256)}).\n` +
+    `Findings checklist:\n${list}\n` +
+    (rec.baseline ? `Baseline at rejection: HEAD ${short(rec.baseline.head)}. The engine rejects this rework unless the tree differs from that baseline${commit ? ' AND you commit (HEAD must advance)' : ''}.\n` : '') +
+    'Order of work: 1) make the edits for the checklist FIRST (no broad exploration); 2) ' + (commit ? 'commit; 3) ' : '') +
+    'only then run the tests. Do not re-implement the original task or touch unrelated code. ' +
+    'End with one line per finding ID: "<ID> FIXED <file>" or "<ID> NOT FIXED <why>".';
+}
+function reworkVerifyNote(rec, manifest) {
+  const ids = rec.findings.map((f) => f.id);
+  return `This is a re-check after rework round ${rec.round}: ${rec.rejectedBy} previously rejected the work (report ${rec.report}). ` +
+    `Changed files since the rejection baseline (HEAD ${short(rec.baseline && rec.baseline.head)}):\n${manifest.map((p) => '  ' + p).join('\n') || '  (not available)'}\n` +
+    (ids.length ? `Original finding IDs: ${ids.join(', ')}. In your report mark EACH ID as FIXED, STILL FAILING or UNVERIFIED, with evidence from the changed files; any STILL FAILING means VERDICT: FAIL.` : 'Verify that every original finding is fixed in the changed files; any still failing means VERDICT: FAIL.');
+}
 
 function verify(stage, vars, res) {
   const problems = [];
@@ -522,9 +628,16 @@ function handleRework(run, stage, vars, res, t0) {
     return 'blocked';
   }
   const back = run.stages[target];
-  run.reworkNotes = run.reworkNotes || {};
-  run.reworkNotes[back.id] = `Rework round ${n}: QA/review FAILED. Fix every finding in ${toSlash(kept)}, then update the sprint log.`;
-  run.history.push({ stage: stage.id, type: 'rework', round: n, max, back: back.id, report: toSlash(kept), at: now() });
+  // Persistent, auditable record (cause 4): report path + sha256, baseline, extracted findings. It is marked
+  // consumed when the rejecting stage finally passes, never deleted.
+  for (const old of reworkRecords(run)) if (old.target === back.id && ['pending', 'built'].includes(old.status)) old.status = 'superseded';
+  const rec = {
+    id: `${stage.id}:${n}`, round: n, max, rejectedBy: stage.id, target: back.id, status: 'pending', at: now(),
+    report: toSlash(kept), reportSha256: sha256(txt), findings: extractFindings(txt),
+    baseline: gitState(workdir(vars)), verdictReport: toSlash(rp),
+  };
+  reworkRecords(run).push(rec);
+  run.history.push({ stage: stage.id, type: 'rework', round: n, max, back: back.id, report: toSlash(kept), reportSha256: rec.reportSha256, findings: rec.findings.map((x) => x.id), baselineHead: rec.baseline && rec.baseline.head, at: now() });
   ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'working', message: `rework ${n}/${max}: ${stage.id} FAIL → back to ${back.id}` });
   console.log(`  ↩ rework ${n}/${max}: ${stage.id} FAIL → back to ${back.id}`);
   run.cursor = target; save(run);
@@ -702,6 +815,7 @@ function writePostmortem(run, stage) {
   ev({ type: 'progress', agent: 'engine', pct: 0, status: 'postmortem', message: `Postmortem stub: ${filePath}` });
   return filePath;
 }
+const rwInfoLast = (run, stageId) => { for (let i = run.history.length - 1; i >= 0; i--) { const h = run.history[i]; if (h.stage === stageId && h.rework && h.ok) return h.rework; } return null; };
 function advance(run) {
   while (run.cursor < run.stages.length) {
     if (paused(run.stages[run.cursor] && run.stages[run.cursor].agent)) { run.status = 'paused'; save(run); console.log('Studio is paused (safe stop). Resume with the switch, then: engine.js resume ' + run.id); return; }
@@ -764,7 +878,34 @@ function advance(run) {
     // so a stage blocked on every tier gets at most one full ladder per resume, never more within a single call.
     const ladder = LADDER[stage.tier || 'local'];
     let feedback = null, done = false, reworked = false;
-    const reworkNote = run.reworkNotes && run.reworkNotes[stage.id];
+    const cwd = workdir(vars);
+    // A rework record is addressed to this stage when it is the rework target (builder side).
+    const rwRec = activeRecord(run, stage.id, 'pending');
+    // onlyOnRework (e.g. the sprint-rework stage): runs only when a review rejection was routed to it.
+    if (stage.onlyOnRework && !rwRec) { run.history.push({ stage: stage.id, type: 'skipped', note: 'no pending rework', at: now() }); run.cursor++; save(run); continue; }
+    let reworkNote = rwRec ? reworkPrompt(rwRec, cwd) : (run.reworkNotes && run.reworkNotes[stage.id]); // legacy in-flight notes still honoured
+    // Verifier side (cause 2): a QA/review stage that follows a rework runs only on a non-empty manifest of changes
+    // since the rejection baseline, and is told that manifest and the finding IDs.
+    if (stage.rework && !rwRec) {
+      const tgt = reworkTarget(run.stages, run.cursor, stage.rework.to, (stage.id.match(/#\d+$/) || [''])[0]);
+      const vrec = tgt >= 0 ? activeRecord(run, run.stages[tgt].id, 'built') : null;
+      const manifest = vrec ? changedSince(vrec.baseline, cwd, reworkExcludes(vrec, run.stages[tgt], vars), run.stages[tgt].reworkPaths) : null;
+      if (vrec && manifest) {
+        if (!manifest.length) {
+          run.status = 'blocked'; run.blockedReason = `${stage.id}: no rework diff to verify (nothing changed since the ${vrec.rejectedBy} rejection baseline ${short(vrec.baseline.head)})`;
+          writePostmortem(run, stage);
+          // so `resume` re-runs the rework builder instead of re-evaluating the same empty manifest
+          run.history.push({ stage: stage.id, type: 'rework-empty-manifest', round: vrec.round, back: run.stages[tgt].id, at: now() });
+          vrec.status = 'pending'; run.cursor = tgt; save(run);
+          ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. ${run.blockedReason}.` });
+          console.log(`\n⛔ BLOCKED at ${stage.id}: ${run.blockedReason}`);
+          return;
+        }
+        reworkNote = reworkVerifyNote(vrec, manifest);
+        run.history.push({ stage: stage.id, type: 'rework-manifest', round: vrec.round, changedPaths: manifest, at: now() });
+      }
+    }
+    const rwTurns = stage.reworkMaxTurns || Math.min(stage.maxTurns || 25, 30);
     let localDown = false;
     for (let attempt = 0; attempt < ladder.length && !done; attempt++) {
       const tierName = ladder[attempt];
@@ -784,7 +925,7 @@ function advance(run) {
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
       const t0 = Date.now();
-      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
+      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote, rwRec ? { rework: true, ...(TIERS[tierName].local ? { maxTurns: rwTurns } : {}) } : {});
       // Codex rate/usage limit or missing binary: skip the tier (not a failure) and fall through (ADR 0004).
       if (res.limited || res.skipped) {
         const why = res.skipped ? 'unavailable' : 'limited';
@@ -793,7 +934,7 @@ function advance(run) {
         console.log(`  skip: ${tierName} ${why}`);
         continue;
       }
-      if (canFinalize(stage, res) && !paused(stage.agent)) {
+      if (!rwRec && canFinalize(stage, res) && !paused(stage.agent)) {
         console.log(`  ↻ hit the turn cap after ${res.turns ?? '?'} turns; finalize turn to write the report`);
         const fin = hooks.runAgent(stage, tierName, vars, null, null, { resume: res.sessionId, prompt: finalizePrompt(stage, vars), maxTurns: FINALIZE_TURNS });
         run.history.push({ stage: stage.id, type: 'finalize', tier: tierName, secs: fin.secs, turns: fin.turns, ok: !fin.error && !fin.hitTurnCap, at: now() });
@@ -827,7 +968,16 @@ function advance(run) {
       const problems = verify(stage, vars, res);
       // Guard (2026-11-07): a build stage that changed nothing has not done its task, even if checks pass.
       if (mustChange(stage) && before !== null && treeSnapshot(workdir(vars)) === before) problems.push('no files changed in ' + workdir(vars) + ' (the task was not implemented)');
-      run.history.push({ stage: stage.id, agent: stage.agent, attempt: attempt + 1, ...res, ok: !problems.length, problems, at: now() });
+      // Rework builder (cause 1): success needs a scoped change vs the REJECTION baseline; in a lane worktree HEAD must advance too.
+      let rwInfo = null;
+      if (rwRec && rwRec.baseline && !res.error && !res.hitTurnCap) {
+        const changedPaths = changedSince(rwRec.baseline, cwd, reworkExcludes(rwRec, stage, vars), stage.reworkPaths) || [];
+        const afterHead = (gitState(cwd) || {}).head || null;
+        rwInfo = { round: rwRec.round, beforeHead: rwRec.baseline.head, afterHead, changedPaths };
+        if (!changedPaths.length) problems.push(`rework made no change since the rejection baseline (HEAD ${short(rwRec.baseline.head)}); fix the findings in the report, do not just re-run checks`);
+        else if (requiresCommit(cwd) && afterHead === rwRec.baseline.head) problems.push(`rework edited files but did not commit: HEAD is still ${short(rwRec.baseline.head)}; git add + git commit the fixes`);
+      }
+      run.history.push({ stage: stage.id, agent: stage.agent, attempt: attempt + 1, ...res, ...(rwInfo ? { rework: rwInfo } : {}), ok: !problems.length, problems, at: now() });
       ev({ type: 'usage', agent: stage.agent, tier: tierName, provider: providerOf(tierName), model: res.model, cloud: res.cloud, tokensIn: res.usage?.in || 0, tokensOut: res.usage?.out || 0, secs: res.secs });
       if (!problems.length) {
         done = true;
@@ -835,6 +985,8 @@ function advance(run) {
         console.log(`  ✓ ${res.secs}s, ${res.turns ?? '?'} turns`);
       } else {
         feedback = problems.join('\n');
+        // A capped or errored rework builder does not get a second local try: straight to the first cloud tier (cause 5).
+        if (rwRec && (res.hitTurnCap || res.error)) { const nxt = ladder.findIndex((t, i) => i > attempt && !TIERS[t].local); if (nxt > attempt + 1) attempt = nxt - 1; }
         ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'blocked', message: `${stage.id} failed on ${tierName}: ${problems[0].slice(0, 120)}` });
         console.log(`  ✗ ${problems.join(' | ').slice(0, 300)}`);
       }
@@ -851,7 +1003,12 @@ function advance(run) {
       console.log(run.status === 'blocked' ? `\n⛔ BLOCKED at ${stage.id}. See .studio/runs/${run.id}.json` : '\nPaused.');
       return;
     }
-    if (run.reworkNotes) delete run.reworkNotes[stage.id]; // note consumed by a successful build
+    if (rwRec) { // built: stays on record until the rejecting stage passes
+      const cur = rwInfoLast(run, stage.id);
+      Object.assign(rwRec, { status: 'built', builtAt: now(), ...(cur ? { beforeHead: cur.beforeHead, afterHead: cur.afterHead, changedPaths: cur.changedPaths } : {}) });
+    }
+    for (const r of reworkRecords(run)) if (r.rejectedBy === stage.id && r.status === 'built') { r.status = 'consumed'; r.consumedAt = now(); } // audit trail kept, not deleted
+    if (run.reworkNotes) delete run.reworkNotes[stage.id]; // legacy note
     run.cursor++; save(run);
   }
   run.status = 'done'; save(run);
@@ -890,4 +1047,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, parseCodexOutput, runCodex, findCodex, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { gitState, changedSince, extractFindings, reworkPrompt, CONTEXT_LIMIT_RX, advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, parseCodexOutput, runCodex, findCodex, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };

@@ -42,13 +42,14 @@ const quiet = (fn) => { const l = console.log; console.log = () => {}; try { ret
   check(run.status === 'done', 'FAIL then PASS finishes the run');
   const builds = log.filter((l) => l.id === 'build#1');
   check(builds.length === 2, 'build ran again after the FAIL');
-  check(builds[1].note && /Rework round 1: QA\/review FAILED\. Fix every finding in .*qa-1-round1\.md, then update the sprint log\./.test(builds[1].note), 'rework note injected into the build prompt');
+  check(builds[1].note && /REWORK round 1\/3\..*qa-1-round1\.md/.test(builds[1].note), 'rework note injected into the build prompt');
   check(builds[0].note === undefined, 'first build has no note');
   check(log.filter((l) => l.id === 'qa#1').every((l) => l.tier === 'local'), 'QA never climbed tiers');
   check(fs.existsSync(path.join(HOME, 'qa-1-round1.md')), 'old report kept as -round1.md');
   const evs = fs.readFileSync(path.join(HOME, '.studio', 'events.jsonl'), 'utf8');
   check(/rework 1\/3: qa#1 FAIL → back to build#1/.test(evs), 'progress event emitted');
   check(run.reworks['qa#1'] === 1, 'rework counter recorded');
+  check(run.reworkRecords.length === 1 && run.reworkRecords[0].status === 'consumed' && /^[0-9a-f]{64}$/.test(run.reworkRecords[0].reportSha256), 'rework record kept and marked consumed, not deleted');
 }
 // 2. straight PASS
 {
