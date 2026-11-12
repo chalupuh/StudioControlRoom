@@ -232,6 +232,7 @@ function getUsage() {
   const budget = { dailyCloudTokens: 200000, ...readJson(path.join(DIR, 'budget.json'), {}) };
   const today = { cloudTokens: 0, localTokens: 0, cloudCalls: 0, localCalls: 0 };
   const byAgent = {};
+  const byProvider = {};
   const days = {};
   const todayKey = dayKey(Date.now());
   for (let i = 13; i >= 0; i--) { const k = dayKey(Date.now() - i * 86400000); days[k] = { day: k, cloudTokens: 0, localTokens: 0 }; }
@@ -239,12 +240,17 @@ function getUsage() {
     if (e.type !== 'usage') continue;
     const tok = (Number(e.tokensIn) || 0) + (Number(e.tokensOut) || 0);
     const k = dayKey(e.ts), cloud = !!e.cloud;
+    // Events from before the provider field: infer from tier/cloud.
+    const prov = ['ollama', 'anthropic', 'openai'].includes(e.provider) ? e.provider : e.tier === 'codex' ? 'openai' : cloud ? 'anthropic' : 'ollama';
+    const p = (byProvider[prov] = byProvider[prov] || { runs: 0, tokens: 0, attempts: 0, limited: 0 });
+    p.attempts++; p.tokens += tok;
+    if (e.limited) p.limited++; else p.runs++;
     const a = (byAgent[e.agent] = byAgent[e.agent] || { cloudTokens: 0, localTokens: 0, calls: 0, secs: 0 });
     a[cloud ? 'cloudTokens' : 'localTokens'] += tok; a.calls++; a.secs += Number(e.secs) || 0;
     if (days[k]) days[k][cloud ? 'cloudTokens' : 'localTokens'] += tok;
     if (k === todayKey) { today[cloud ? 'cloudTokens' : 'localTokens'] += tok; today[cloud ? 'cloudCalls' : 'localCalls']++; }
   }
-  return { budget, today, byAgent, byDay: Object.values(days) };
+  return { budget, today, byAgent, byProvider, byDay: Object.values(days) };
 }
 
 // ---- GPU / Ollama / ComfyUI (cached 2 s, never throws) ----
