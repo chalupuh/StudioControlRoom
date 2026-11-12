@@ -4,6 +4,8 @@ const fs = require('fs'), os = require('os'), path = require('path');
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-finalize-'));
 process.env.STUDIO_HOME = HOME;
 const engine = require('./engine.js');
+// QA stages skip the codex tier on win32 (codex sandbox spawn EPERM).
+const WIN = process.platform === 'win32';
 
 let fails = 0;
 const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) fails++; };
@@ -47,7 +49,7 @@ const reset = () => { try { fs.unlinkSync(rp); } catch {} };
   };
   const run = mkRun('f2', qaStage()); quiet(() => engine.advance(run));
   check(run.status === 'done' && calls.every((c) => !c.opts.resume), 'no finalize without a session');
-  check(calls.map((c) => c.tier).join() === 'local,local,codex,sonnet', 'ladder unchanged');
+  check(calls.map((c) => c.tier).join() === (WIN ? 'local,local,sonnet' : 'local,local,codex,sonnet'), 'ladder unchanged');
 }
 
 // 3. build stages never finalize (they must change code, not write a report)
@@ -65,7 +67,7 @@ const reset = () => { try { fs.unlinkSync(rp); } catch {} };
   engine.hooks.localReady = () => { checks++; return false; };
   engine.hooks.runAgent = (stage, tier) => { calls.push(tier); fs.writeFileSync(rp, 'VERDICT: PASS\n'); return { tier, model: 's', secs: 1, turns: 5, result: 'ok' }; };
   const run = mkRun('f4', qaStage()); quiet(() => engine.advance(run));
-  check(calls.join() === 'codex' && run.status === 'done', 'only the cloud tier ran (first cloud tier: codex)');
+  check(calls.join() === (WIN ? 'sonnet' : 'codex') && run.status === 'done', 'only the cloud tier ran (first cloud tier)');
   check(checks === 1, 'server checked once per stage');
   check(run.history.filter((h) => h.type === 'local-down').length === 1 && !run.history.some((h) => h.ok === false), 'one local-down note, no failed attempt recorded');
 }

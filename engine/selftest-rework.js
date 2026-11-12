@@ -70,7 +70,8 @@ const quiet = (fn) => { const l = console.log; console.log = () => {}; try { ret
   const log = []; fake(['crash', 'crash', 'crash'], log);
   const run = mkRun('r4', 3); quiet(() => engine.advance(run));
   const tiers = log.filter((l) => l.id === 'qa#1').map((l) => l.tier);
-  check(tiers.join(',') === 'local,local,codex,sonnet', 'crashed QA climbs local, local, codex, sonnet');
+  const want = process.platform === 'win32' ? 'local,local,sonnet' : 'local,local,codex,sonnet'; // QA skips codex on win32 (spawn EPERM)
+  check(tiers.join(',') === want, 'crashed QA climbs ' + want);
   check(run.status === 'blocked' && /failed on every tier/.test(run.blockedReason) && !run.reworks, 'blocked as a genuine failure, no rework');
 }
 // 5. no report, clean run -> genuine failure too
