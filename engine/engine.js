@@ -233,14 +233,18 @@ function runCodex(stage, vars, feedback, reworkNote) {
     const modBin = path.join(npmPrefix, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
     if (fs.existsSync(modBin)) resolved = modBin;
   }
+  // When resolved === exe (.cmd file), need shell:true on Windows so cmd.exe handles the batch script.
+  // When resolved !== exe (npm module found), spawn node directly — no shell, no orphan risk.
+  const needShell = resolved === exe && /\.(cmd|bat)$/i.test(exe);
   const r = exe
     ? (resolved !== exe
       ? spawnSync(process.execPath, [resolved, ...args], { cwd, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 })
-      : spawnSync(exe, args, { cwd, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 }))
+      : spawnSync(exe, args, { cwd, shell: needShell, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 }))
     : { status: null, error: Object.assign(new Error('codex not found'), { code: 'ENOENT' }), stdout: '', stderr: '' };
   const p = parseCodexOutput(r);
   const base = { tier: 'codex', model: 'codex', secs: Math.round((Date.now() - t0) / 1000), cloud: true };
   if (p.missing) {
+    ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'warning', message: `${stage.id}: codex unavailable, skipping tier` });
     return { ...base, result: '', error: 'codex binary not found', usage: null, turns: 0, skipped: true };
   }
   return { ...base, result: p.result, error: p.error, usage: p.usage, turns: p.turns, ...(p.limited ? { limited: true } : {}) };
