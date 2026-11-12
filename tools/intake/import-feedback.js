@@ -53,7 +53,11 @@ function parseFeedback(input) {
     const h = lines[i].trim().match(HEADER);
     if (!h) continue;
     const body = [];
-    let j = i + 2; // skip the submitter line
+    // The line after the header is the submitter (an email or one bare token); drop it only then.
+    const sub = (lines[i + 1] || '').trim();
+    const hasSubmitter = sub !== '' && (/@/.test(sub) || !/\s/.test(sub))
+      && sub !== 'Update status' && !HEADER.test(sub);
+    let j = i + (hasSubmitter ? 2 : 1);
     for (; j < lines.length; j++) {
       if (lines[j].trim() === 'Update status') break;
       if (HEADER.test(lines[j].trim())) { j--; break; }
@@ -66,14 +70,16 @@ function parseFeedback(input) {
   return items;
 }
 
+const clean = (v) => String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f\u2028\u2029]+/g, ' ').trim();
+
 function toMarkdown(item, project) {
   return [
     '---',
-    `id: ${item.sourceId}`,
-    `project: ${project}`,
-    `status: ${item.status}`,
-    `language: ${item.language || ''}`,
-    `route: ${item.route || ''}`,
+    `id: ${clean(item.sourceId)}`,
+    `project: ${clean(project)}`,
+    `status: ${clean(item.status)}`,
+    `language: ${clean(item.language)}`,
+    `route: ${clean(item.route)}`,
     '---',
     '',
     item.text,
@@ -95,6 +101,10 @@ function main(argv) {
   let items;
   try { items = parseFeedback(fs.readFileSync(args._[0], 'utf8')); }
   catch (e) { console.error(`cannot read export: ${e.message}`); return 1; }
+  if (!items.length) {
+    console.error('warning: no feedback items found in the export (unrecognised layout or invalid JSON); nothing written');
+    return 1;
+  }
   fs.mkdirSync(args.out, { recursive: true });
   let wrote = 0;
   let skipped = 0;

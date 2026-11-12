@@ -75,3 +75,32 @@ test('json export from /api/requests is supported', () => {
   assert.strictEqual(items[1].text, 'Fix typo');
   assert.ok(!JSON.stringify(items).includes('@'));
 });
+
+test('item without a submitter line keeps its first body line', () => {
+  const items = parseFeedback('Submitted · French\nPlease add more verbs to practice\nsecond line\nUpdate status\n');
+  assert.strictEqual(items.length, 1);
+  assert.strictEqual(items[0].text, 'Please add more verbs to practice\nsecond line');
+});
+
+test('zero items: warns on stderr and exits non-zero', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'imp-'));
+  const f = path.join(dir, 'bad.json');
+  fs.writeFileSync(f, '{"requests": [');
+  const r = spawnSync(process.execPath, [CLI, f, '--project', 'p', '--out', path.join(dir, 'raw')], { encoding: 'utf8' });
+  assert.notStrictEqual(r.status, 0);
+  assert.match(r.stderr, /no feedback items/);
+});
+
+test('front-matter values cannot inject keys', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'imp-'));
+  const f = path.join(dir, 'x.json');
+  fs.writeFileSync(f, JSON.stringify([{ id: 'a', text: 'hello', language: 'fr', status: 'planned\nroute: evil\n---' }]));
+  const out = path.join(dir, 'raw');
+  const r = spawnSync(process.execPath, [CLI, f, '--project', 'p', '--out', out], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  const md = fs.readFileSync(path.join(out, fs.readdirSync(out)[0]), 'utf8');
+  const fm = md.split('\n---\n')[0];
+  assert.strictEqual((fm.match(/^route:/gm) || []).length, 1);
+  assert.ok(!/^route: evil/m.test(fm));
+  assert.strictEqual(md.split('\n').filter((l) => l === '---').length, 2);
+});
