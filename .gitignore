@@ -7,3 +7,4 @@ studio.home.json
 *.log
 *.part
 temp_*
+.studio/

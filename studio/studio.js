@@ -8,9 +8,15 @@
 //   node .studio/studio.js checkpoint <agent> "<where>" "<next>" ["<files>"]
 //   node .studio/studio.js checkpoint-clear <agent>       <- archive after resuming
 //   node studio/studio.js shutdown | startup               <- Game mode: one-shot total shutdown / bring back
+//   node studio/studio.js token [rotate]                  <- show current token / rotate it
+//   node studio/studio.js pair [port]                     <- LAN pairing URL(s) + QR code for a phone
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const os = require('os');
+
+// Auth: extracted to testable module; studio-local functions delegate to it.
+const auth = require('./auth');
 
 // SOFT = where this software lives (dashboard.html, app-dist). HOME = the org workspace (agents, docs,
 // runtime data in HOME/.studio). They are the same folder today; after the StudioControlRoom split they differ.
@@ -194,6 +200,98 @@ function parseEvents(text) {
 const { usageFromEvents } = require('./usage');
 function readEvents() { return fs.existsSync(LOG) ? parseEvents(fs.readFileSync(LOG, 'utf8')) : []; }
 
+// ---- Auth token ----
+function generateToken() { return auth.generateToken(); }
+function readAuth() { return auth.readAuth(DIR); }
+function writeAuth(a) { auth.writeAuth(DIR, a); }
+function ensureToken() { return auth.ensureToken(DIR); }
+function currentToken() { return auth.currentToken(DIR); }
+function verifyToken(provided) {
+  const expected = currentToken();
+  if (!expected) return false;
+  return auth.verifyToken(provided, expected);
+}
+
+// ---- LAN bind address ----
+// Read machine.json profile (HOME/.studio/machine.json).
+// TODO(lane merge): Lane H's studio/machine.js loads the same file (with defaults + bad-JSON warning).
+// When the lanes merge, replace readMachineConfig/getLanBind with require('./machine').load().controlRoom.bind.
+function readMachineConfig() {
+  try { return JSON.parse(fs.readFileSync(path.join(DIR, 'machine.json'), 'utf8')); } catch { return {}; }
+}
+
+function getLanBind() {
+  // 1. STUDIO_BIND env var
+  if (process.env.STUDIO_BIND) return process.env.STUDIO_BIND;
+  // 2. machine.json controlRoom.bind
+  const mc = readMachineConfig();
+  if (mc.controlRoom && mc.controlRoom.bind) return mc.controlRoom.bind;
+  // 3. default: loopback only
+  return '127.0.0.1';
+}
+
+// ---- Pairing (phone on the LAN) ----
+// One entry per private IPv4 address of this host; each is a ready-to-open pairing link.
+// Virtual adapters (WSL, Hyper-V, Docker, VPN...) are sorted last instead of dropped —
+// a Hyper-V External switch can hold the host's real LAN address.
+// Home /24 (192.168.x) addresses sort first. Result is cached for 30 s.
+const VIRTUAL_NIC = /vEthernet|WSL|Hyper-V|Docker|VirtualBox|VMware|Loopback/i;
+let _lanCache = { at: 0, val: null };
+const LAN_CACHE_TTL = 30000;
+function lanAddresses(ifaces) {
+  const live = ifaces === undefined;
+  if (live) {
+    if (Date.now() - _lanCache.at < LAN_CACHE_TTL && _lanCache.val !== null) return _lanCache.val;
+    ifaces = os.networkInterfaces();
+  }
+  const out = [];
+  const virtual = [];
+  for (const [name, list] of Object.entries(ifaces)) {
+    const isVirtual = VIRTUAL_NIC.test(name);
+    for (const ni of list || []) {
+      if (ni.family !== 'IPv4' || ni.internal || !auth.isPrivateIP(ni.address)) continue;
+      (isVirtual ? virtual : out).push(ni.address);
+    }
+  }
+  const result = [...new Set([...out, ...virtual])].sort(
+    (a, b) => Number(b.startsWith('192.168.')) - Number(a.startsWith('192.168.'))
+  );
+  if (live) {
+    _lanCache = { at: Date.now(), val: result };
+  }
+  return result;
+}
+// preferHost: the Host header the browser used; if it is one of our LAN addresses it goes first.
+function lanPairUrls(port, token, preferHost) {
+  const addrs = lanAddresses();
+  const h = String(preferHost || '').replace(/:\d+$/, '');
+  const i = addrs.indexOf(h);
+  if (i > 0) addrs.unshift(addrs.splice(i, 1)[0]);
+  return addrs.map((a) => `http://${a}:${port}/pair?t=${token}`);
+}
+
+const isLoopbackBind = (b) => /^(127(\.\d{1,3}){3}|::1|localhost)$/i.test(String(b || '').trim());
+
+function pairCommand(rest) {
+  const qr = require('./qr');
+  const port = Number(rest[0]) || Number(process.env.PORT) || 4777;
+  const urls = lanPairUrls(port, ensureToken().token);
+  if (!urls.length) { console.log('No private LAN IPv4 address found on this host.'); process.exitCode = 1; return; }
+  const bind = getLanBind();
+  if (isLoopbackBind(bind)) {
+    console.log(`Note: the server is bound to ${bind} (loopback only). Set STUDIO_BIND=0.0.0.0 (or controlRoom.bind in machine.json) and restart, or a phone cannot connect.\n`);
+  }
+  console.log('Open one of these on your phone (same Wi-Fi/LAN):');
+  for (const u of urls) console.log('  ' + u);
+  console.log('\n' + qr.toTerminal(qr.encode(urls[0])) + '\n');
+  console.log('(QR is for the first link. It is drawn for dark terminals; on a light terminal, invert colours or use a link.)');
+  console.log('If the phone cannot connect, allow the port: powershell -File studio\\firewall.ps1 -Port ' + port);
+}
+
+// ---- Auth state ----
+const rateStore = auth.createRateStore();
+let _isLanMode = false;
+
 function runSummary(run) {
   const cur = run.cursor || 0;
   const stages = (run.stages || []).map((s, i) => ({
@@ -331,11 +429,55 @@ function serve(port = 4777) {
   const html = path.join(SOFT, 'dashboard.html');
   const json = (res, obj, code = 200) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(obj)); };
   const text = (res, s, code = 200) => { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(s); };
+
+  // Determine bind address and LAN mode
+  const bindAddr = getLanBind();
+  _isLanMode = !isLoopbackBind(bindAddr);
+
+  // Ensure token exists when in LAN mode
+  if (_isLanMode) ensureToken();
+
+  const authMiddleware = auth.makeAuthMiddleware(json, DIR, rateStore);
   startWatchers();
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname, m = req.method;
+
+    // ---- defence in depth: source IP, Host (DNS rebinding) and Origin (CSRF) ----
+    if (_isLanMode && !auth.isPrivateIP(auth.rateLimitKey(req))) return json(res, { error: 'forbidden' }, 403);
+    const hostName = String(req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
+    if (!['localhost', '127.0.0.1', '[::1]', bindAddr.toLowerCase(), ...lanAddresses()].includes(hostName)) return json(res, { error: 'forbidden host' }, 403);
+    if (m !== 'GET' && m !== 'HEAD' && req.headers.origin) {
+      let oh = ''; try { oh = new URL(req.headers.origin).host.toLowerCase(); } catch {}
+      if (oh !== String(req.headers.host || '').toLowerCase()) return json(res, { error: 'forbidden origin' }, 403);
+    }
+
+    // ---- /pair: validate token, set HttpOnly cookie, redirect to / ----
+    if (p === '/pair' && m === 'GET') {
+      const tParam = url.searchParams.get('t');
+      // LAN: same IP check + failure rate limit as /api/* (no unlimited guessing here)
+      if (_isLanMode && !tParam) return json(res, { error: 'unauthorized' }, 401);
+      if (_isLanMode && !authMiddleware.check(req, res, tParam)) return;
+      if (tParam && verifyToken(tParam)) {
+        res.writeHead(302, {
+          'Location': '/',
+          'Set-Cookie': `studio_token=${tParam}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`,
+          'Cache-Control': 'no-store',
+          'Referrer-Policy': 'no-referrer',
+        });
+        res.end();
+        return;
+      }
+      // If no token or invalid token: in LAN mode, 401; loopback, redirect anyway
+      if (_isLanMode) return json(res, { error: 'unauthorized' }, 401);
+      res.writeHead(302, { 'Location': '/' });
+      res.end();
+      return;
+    }
+
+    // ---- auth gate (LAN mode): everything except /pair and the static SPA shell ----
+    if (_isLanMode && /^\/(api\/|control$|checkpoints$|models$|events$|v1$|portraits\/|village\/)/.test(p) && !authMiddleware(req, res)) return;
 
     // ---- legacy endpoints (used by dashboard.html) ----
     if (p === '/control') {
@@ -352,60 +494,67 @@ function serve(port = 4777) {
     if (p === '/events') return json(res, readEvents());
     if (p === '/v1') return sendFile(res, html, { 'Cache-Control': 'no-store' });
 
-    // ---- v2 API ----
-    if (p === '/api/state' && m === 'GET') return json(res, getState());
-    if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
-    if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
-    if (p === '/api/stream' && m === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-      res.write(': connected\n\n');
-      clients.add(res);
-      req.on('close', () => clients.delete(res));
-      return;
+    // ---- v2 API (auth already enforced by the gate above in LAN mode) ----
+    if (p.startsWith('/api/')) {
+      if (p === '/api/state' && m === 'GET') return json(res, getState());
+      if (p === '/api/pair-qr' && m === 'GET') {
+        if (!_isLanMode) return json(res, { error: 'LAN mode is off: set STUDIO_BIND or controlRoom.bind' }, 409);
+        const qr = require('./qr');
+        const urls = lanPairUrls(port, ensureToken().token, req.headers.host);
+        if (!urls.length) return json(res, { error: 'no LAN address' }, 404);
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+        return res.end(qr.toSvg(qr.encode(urls[0])));
+      }
+      if (p === '/api/usage' && m === 'GET') return json(res, getUsage());
+      if (p === '/api/gpu' && m === 'GET') return json(res, await getGpu());
+      if (p === '/api/stream' && m === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+        res.write(': connected\n\n');
+        clients.add(res);
+        req.on('close', () => clients.delete(res));
+        return;
+      }
+      if (p === '/api/shutdown' && m === 'POST') {
+        // One-shot Game mode: run in a detached process so it can also stop this server at the end.
+        const out = fs.openSync(path.join(DIR, 'shutdown.log'), 'a');
+        require('child_process').spawn(process.execPath, [path.join(SOFT, 'studio.js'), 'shutdown'], { detached: true, windowsHide: true, stdio: ['ignore', out, out] }).unref();
+        return json(res, { ok: true, message: 'Shutting down: agents checkpoint, local models and ComfyUI stop, then this server stops.' });
+      }
+      if (p === '/api/control' && m === 'POST') {
+        const b = await readBody(req);
+        if (b.action !== 'pause' && b.action !== 'resume') return json(res, { error: 'action must be pause or resume' }, 400);
+        if (b.team != null && !TEAMS.includes(b.team)) return json(res, { error: 'team must be eng, rd or creative' }, 400);
+        return json(res, setControl(b.action === 'pause' ? 'paused' : 'running', 'dashboard', b.team || undefined));
+      }
+      let mt;
+      if (m === 'POST' && (mt = p.match(/^\/api\/gates\/([^/]+)$/))) {
+        const runId = decodeURIComponent(mt[1]);
+        if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
+        const b = await readBody(req);
+        if (b.decision !== 'approve' && b.decision !== 'reject') return json(res, { error: 'decision must be approve or reject' }, 400);
+        const note = typeof b.note === 'string' ? b.note.slice(0, 2000) : '';
+        const run = readJson(path.join(RUNS, runId + '.json'), null);
+        if (!run) return json(res, { error: 'run not found' }, 404);
+        if (run.status !== 'waiting-gate') return json(res, { error: 'run is not waiting at a gate' }, 409);
+        spawnEngine(['approve', runId, b.decision, note], runId);
+        return json(res, { ok: true });
+      }
+      if (m === 'POST' && (mt = p.match(/^\/api\/runs\/([^/]+)\/resume$/))) {
+        const runId = decodeURIComponent(mt[1]);
+        if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
+        if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
+        spawnEngine(['resume', runId], runId);
+        return json(res, { ok: true });
+      }
+      if (p === '/api/file' && m === 'GET') {
+        // gate links carry absolute {{home}} paths; resolveDocPath maps those inside HQ to docs/… and refuses the rest
+        const full = require('./filepath.js').resolveDocPath(url.searchParams.get('path') || '', REPO);
+        if (!full) return text(res, 'forbidden', 403);
+        if (!isFile(full)) return text(res, 'not found', 404);
+        return text(res, fs.readFileSync(full, 'utf8'));
+      }
+      return json(res, { error: 'not found' }, 404);
     }
-    if (p === '/api/shutdown' && m === 'POST') {
-      // One-shot Game mode: run in a detached process so it can also stop this server at the end.
-      const out = fs.openSync(path.join(DIR, 'shutdown.log'), 'a');
-      require('child_process').spawn(process.execPath, [path.join(SOFT, 'studio.js'), 'shutdown'], { detached: true, windowsHide: true, stdio: ['ignore', out, out] }).unref();
-      return json(res, { ok: true, message: 'Shutting down: agents checkpoint, local models and ComfyUI stop, then this server stops.' });
-    }
-    if (p === '/api/control' && m === 'POST') {
-      const b = await readBody(req);
-      if (b.action !== 'pause' && b.action !== 'resume') return json(res, { error: 'action must be pause or resume' }, 400);
-      if (b.team != null && !TEAMS.includes(b.team)) return json(res, { error: 'team must be eng, rd or creative' }, 400);
-      return json(res, setControl(b.action === 'pause' ? 'paused' : 'running', 'dashboard', b.team || undefined));
-    }
-    let mt;
-    if (m === 'POST' && (mt = p.match(/^\/api\/gates\/([^/]+)$/))) {
-      const runId = decodeURIComponent(mt[1]);
-      if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
-      const b = await readBody(req);
-      if (b.decision !== 'approve' && b.decision !== 'reject') return json(res, { error: 'decision must be approve or reject' }, 400);
-      const note = typeof b.note === 'string' ? b.note.slice(0, 2000) : '';
-      const run = readJson(path.join(RUNS, runId + '.json'), null);
-      if (!run) return json(res, { error: 'run not found' }, 404);
-      if (run.status !== 'waiting-gate') return json(res, { error: 'run is not waiting at a gate' }, 409);
-      spawnEngine(['approve', runId, b.decision, note], runId);
-      return json(res, { ok: true });
-    }
-    if (m === 'POST' && (mt = p.match(/^\/api\/runs\/([^/]+)\/resume$/))) {
-      const runId = decodeURIComponent(mt[1]);
-      if (!/^[\w-]+$/.test(runId)) return json(res, { error: 'invalid run id' }, 400);
-      if (!fs.existsSync(path.join(RUNS, runId + '.json'))) return json(res, { error: 'run not found' }, 404);
-      spawnEngine(['resume', runId], runId);
-      return json(res, { ok: true });
-    }
-    if (p === '/api/file' && m === 'GET') {
-      const raw = url.searchParams.get('path') || '';
-      if (raw.includes('\0') || raw.includes('..') || raw.includes('\\') || path.isAbsolute(raw) || /^[a-zA-Z]:/.test(raw)) return text(res, 'forbidden', 403);
-      const norm = path.posix.normalize(raw);
-      if (!/\.md$/i.test(norm) || !(norm.startsWith('docs/') || norm.startsWith('.studio/checkpoints/'))) return text(res, 'forbidden', 403);
-      const full = path.resolve(REPO, norm);
-      if (!full.startsWith(REPO + path.sep)) return text(res, 'forbidden', 403);
-      if (!isFile(full)) return text(res, 'not found', 404);
-      return text(res, fs.readFileSync(full, 'utf8'));
-    }
-    if (p.startsWith('/api/')) return json(res, { error: 'not found' }, 404);
 
     if (p.startsWith('/portraits/') && m === 'GET') {
       const full = safeJoin(PORTRAITS, p.slice('/portraits/'.length));
@@ -430,7 +579,13 @@ function serve(port = 4777) {
 
   http.createServer((req, res) => {
     handle(req, res).catch(() => { try { if (!res.headersSent) json(res, { error: 'server error' }, 500); else res.end(); } catch {} });
-  }).listen(port, '127.0.0.1', () => { try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {} console.log(`Studio dashboard: http://localhost:${port}`); });
+  }).listen(port, bindAddr, () => {
+    try { fs.writeFileSync(path.join(DIR, 'server.pid'), String(process.pid)); } catch {}
+    console.log(`Studio dashboard: http://localhost:${port}`);
+    if (_isLanMode) {
+      console.log(`LAN mode: authentication required. Token in ${path.join(DIR, 'auth.json')}`);
+    }
+  });
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -441,8 +596,21 @@ else if (cmd === 'resume') console.log(setControl('running'));
 else if (cmd === 'status') { console.log(getControl()); for (const c of listCheckpoints()) console.log('\n' + c.text); }
 else if (cmd === 'checkpoint') checkpoint(rest);
 else if (cmd === 'checkpoint-clear') clearCheckpoint(rest);
-else if (cmd === 'serve') serve(Number(process.env.PORT) || Number(rest[0]) || 4777);
+else if (cmd === 'serve') serve(Number(rest[0]) || Number(process.env.PORT) || 4777);
+else if (cmd === 'token') {
+  // token subcommands: show current token, or rotate (create/replace)
+  const sub = rest[0];
+  if (sub === 'rotate') {
+    writeAuth({ token: generateToken(), created: Date.now() });
+    console.log(`Token rotated. Re-pair devices with "studio.js pair"; existing cookies and links stop working.`);
+  } else {
+    // Show current token (create if missing)
+    const a = ensureToken();
+    console.log(`Token: ${a.token}`);
+  }
+}
+else if (cmd === 'pair') pairCommand(rest);
 else if (cmd === 'shutdown' || cmd === 'game-mode') require('./power').shutdown({ HOME, DIR, setControl, append, checkpoint, keepServer: rest.includes('--keep-server'), graceSec: Number((rest.find((a) => a.startsWith('--grace=')) || '').slice(8)) || 60 }).then(() => process.exit(0));
 else if (cmd === 'startup') require('./power').startup({ HOME, DIR });
 else if (cmd === 'reset') { fs.writeFileSync(LOG, ''); console.log('Event log cleared.'); }
-else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup');
+else console.log('commands: hook | log | serve | reset | pause | resume | status | checkpoint | checkpoint-clear | shutdown [--keep-server] [--grace=60] | startup | token [rotate] | pair [port]');

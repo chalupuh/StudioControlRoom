@@ -5,6 +5,7 @@ const fs = require('fs'), os = require('os'), path = require('path');
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-rework-'));
 process.env.STUDIO_HOME = HOME;
 const engine = require('./engine.js');
+engine.hooks.localReady = () => true; // no real Ollama check in tests
 
 let fails = 0;
 const check = (ok, name) => { console.log(`  ${ok ? '✓' : '✗'} ${name}`); if (!ok) fails++; };

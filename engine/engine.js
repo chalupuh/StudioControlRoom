@@ -77,10 +77,15 @@ function claudeExe() {
   return found.pop();
 }
 
-function fill(tpl, vars) {
+function fill(tpl, vars, depth = 0) {
   return String(tpl || '')
     .replace(/\{\{file:([^}]+)\}\}/g, (_, f) => { const p = path.resolve(REPO, fill(f, vars)); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : `(missing: ${f})`; })
-    .replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] ?? `{{${k}}}`));
+    .replace(/\{\{(\w+)\}\}/g, (_, k) => {
+      const v = vars[k];
+      if (v === undefined || v === null) return `{{${k}}}`;
+      // a var whose value names other vars (title "feat: internal sprint {{sprint}}") is filled too, one level deep
+      return depth < 1 && typeof v === 'string' && /\{\{\w+\}\}/.test(v) ? fill(v, vars, depth + 1) : v;
+    });
 }
 
 // Forward slashes: these paths are substituted into JS/JSON/shell strings in pipeline commands, where
@@ -256,52 +261,130 @@ const load = (id) => JSON.parse(fs.readFileSync(runFile(id), 'utf8'));
 // A partial success (hasFailure but hasResult) does NOT report an error.
 // The [claude-code:unrecognized_model] stderr warning is logged to ignoredWarning for
 // observability but NEVER suppresses an error — real failures must still be reported.
+const isCliErrorResult = (result) => {
+  const t = String(result || '').trim();
+  // The token-limit phrase only counts in a short, error-sized result, so a long real report that merely
+  // mentions it (e.g. a review of this very check) is not misread as a failure.
+  return /^API Error:/i.test(t) || (t.length < 500 && /exceeded the \d+ output token maximum/i.test(t));
+};
+// A plan usage/rate limit ("You've hit your 5-hour limit · resets 4am") is not a failure of the stage: the
+// engine waits for the reset and retries the same tier (2026-11-09: every run blocked at ~2 AM on this).
+// Only short, error-sized texts count, and parseRunOutput only asks when the run itself failed, so a finished
+// report that mentions rate limiting ("added a 429 rate limit to /login") is never misread.
+const USAGE_LIMIT_RX = /hit your .{0,30}limit|\b(5-hour|session|weekly|opus|sonnet|usage)\s+limit\s+(reached|exceeded)|limit reached.{0,10}resets|^API Error:.{0,80}\b(rate[_ ]limit|429)\b/i;
+const isUsageLimit = (text) => {
+  const t = String(text || '').trim();
+  return t.length > 0 && t.length < 600 && USAGE_LIMIT_RX.test(t);
+};
 function parseRunOutput(r) {
   let out = {};
   try { out = JSON.parse((r.stdout || '').trim().split('\n').filter(Boolean).pop() || '{}'); } catch {}
-  const stderr = (r.stderr || '');
-  const modelWarning = stderr.includes('[claude-code:unrecognized_model]');
+  const rawStderr = (r.stderr || '');
+  const modelWarning = rawStderr.includes('[claude-code:unrecognized_model]');
+  // Known harmless warnings must not be reported as the failure reason (they hid the real cause overnight).
+  const stderr = rawStderr.split(/\r?\n/).filter((l) => !/^\s*(?:⚠ claude\.ai connectors are disabled|.*\[claude-code:unrecognized_model\]|Ignoring \d+ permissions\.allow entries)/.test(l)).join('\n').trim();
   const hasFailure = out.is_error || r.status !== 0 || !!r.error || !!r.signal;
   const hasResult = !!out.result;
+  const usageLimit = !!hasFailure && (isUsageLimit(out.result) || isUsageLimit(rawStderr.slice(-2000)));
+  // A CLI/API error printed as the "result" (e.g. "API Error: ... exceeded the 32000 output token maximum")
+  // is not an answer: report it as an error so the attempt fails and climbs the tier ladder.
+  // (is_error with a real result stays a partial success by design; see selftest.js.)
+  const cliError = isCliErrorResult(out.result);
   return {
     turns: out.num_turns,
     result: String(out.result || '').slice(0, 2000),
-    error: (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
-    ignoredWarning: modelWarning ? stderr.slice(0, 300) : null,
+    error: cliError ? String(out.result).trim().slice(0, 800)
+      : (hasFailure && !hasResult) ? stderr.slice(-800) || out.subtype || String(r.error?.code || r.error || r.signal || 'exit ' + r.status) : null,
+    ignoredWarning: modelWarning ? rawStderr.slice(0, 300) : null,
+    usageLimit,
     usage: out.usage ? { in: out.usage.input_tokens, out: out.usage.output_tokens, cached: out.usage.cache_read_input_tokens } : null,
     hitTurnCap: out.subtype === 'error_max_turns',
+    sessionId: out.session_id || null,
   };
 }
 
+// Env for a local (Ollama) tier. Claude Code does not know the local model, so it assumes a 200k window
+// and never compacts, while Ollama serves only `contextLength` tokens (32k default). Past that, Ollama
+// truncates the prompt and stops after a few tokens with max_tokens, which Claude Code reports as
+// "exceeded the 32000 output token maximum" — every long local stage failed this way on 2026-11-09.
+// Telling Claude Code the real window makes it auto-compact in time; the output cap leaves room for the reply.
+const LOCAL_CONTEXT_DEFAULT = 32768;
+function localTierEnv(tier, machineCfg = {}) {
+  const o = machineCfg.ollama || {};
+  const ctx = Number(o.contextLength) || LOCAL_CONTEXT_DEFAULT;
+  const maxOut = Number(o.maxOutputTokens) || Math.min(8192, Math.floor(ctx / 4));
+  return {
+    ANTHROPIC_BASE_URL: o.url || 'http://127.0.0.1:11434', ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+    ANTHROPIC_MODEL: tier.model, ANTHROPIC_DEFAULT_OPUS_MODEL: tier.model, ANTHROPIC_DEFAULT_SONNET_MODEL: tier.model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3:4b', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(ctx), CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOut),
+  };
+}
+
+// Every stage runs headless: nobody can answer a question or approve a prompt (2026-11-09: local runs asked
+// "what would you like me to work on?", builders stopped to ask "want me to commit?").
+// Only build stages working in their own checkout (a lane worktree or app repo) commit. Stages that run in the
+// HQ checkout (R&D, research) or that only check work (QA, review) never commit: HQ sits on main with unrelated
+// runtime files, and git there goes through branch → PR → squash merge (ADR 0002).
+// Never on main/master either: internal pipelines use workdir={{soft}}, which is the main checkout if the
+// engine is ever run without a lane worktree.
+const currentBranch = (cwd) => { try { return spawnSync('git', ['branch', '--show-current'], { cwd, encoding: 'utf8' }).stdout.trim(); } catch { return ''; } };
+const commitsWork = (stage, cwd) => mustChange(stage) && !!cwd && cwd !== REPO && !['main', 'master'].includes(currentBranch(cwd));
+function unattendedRules(stage, cwd) {
+  const git = commitsWork(stage, cwd)
+    ? 'commit your changes to the current branch (git add <files> + git commit; never push, never switch branches)'
+    : 'do NOT commit or change git state; the engine and the owner handle git for this stage';
+  return 'You are running unattended in a pipeline: nobody will read questions or approve prompts until you finish. ' +
+    `Never ask what to do, never ask for confirmation and never wait for approval. Do the task now, ${git}, write every required file, ` +
+    'then end with a short report. If a command is refused, keep going with what you can do and say in the report exactly which command could not run.';
+}
+// Auto-approved for headless stages. Note: DISALLOWED_TOOLS only guards direct invocations; anything that can run
+// arbitrary code (node -e, npm scripts) could still reach git. That is accepted for node/npm, which every build
+// and QA stage needs; shells that take inline commands (powershell -c, pwsh, npx <any package>, find -exec) are
+// not granted: PowerShell is limited to running script files, npx to the project's own dev tools.
+const BASE_ALLOWED_TOOLS = ['Read', 'Write', 'Edit', 'Glob', 'Grep',
+  'Bash(git status:*)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git show:*)', 'Bash(git rev-parse:*)', 'Bash(git ls-files:*)',
+  'Bash(git branch --show-current:*)',
+  'Bash(npm test:*)', 'Bash(npm run:*)', 'Bash(npm install:*)', 'Bash(npm ci:*)', 'Bash(npm ls:*)', 'Bash(node:*)',
+  'Bash(npx tsc:*)', 'Bash(npx jest:*)', 'Bash(npx vitest:*)', 'Bash(npx eslint:*)', 'Bash(npx prettier:*)', 'Bash(npx expo:*)',
+  'Bash(powershell -NoProfile -ExecutionPolicy Bypass -File:*)', 'Bash(powershell -ExecutionPolicy Bypass -File:*)', 'Bash(powershell -File:*)',
+  'Bash(ls:*)', 'Bash(cat:*)', 'Bash(head:*)', 'Bash(tail:*)', 'Bash(wc:*)', 'Bash(grep:*)', 'Bash(rg:*)', 'Bash(mkdir:*)', 'Bash(touch:*)',
+  'Bash(cp:*)', 'Bash(mv:*)', 'Bash(cd:*)', 'Bash(pwd:*)', 'Bash(echo:*)', 'Bash(diff:*)', 'Bash(sort:*)'];
+const COMMIT_TOOLS = ['Bash(git add:*)', 'Bash(git commit:*)', 'Bash(git mv:*)', 'Bash(git rm:*)', 'Bash(git restore:*)', 'Bash(git stash:*)'];
+const DISALLOWED_TOOLS = ['Bash(git push:*)', 'Bash(git reset --hard:*)', 'Bash(git clean:*)', 'Bash(git checkout:*)',
+  'Bash(git switch:*)', 'Bash(git rebase:*)', 'Bash(git -C:*)', 'Bash(gh:*)', 'Bash(npm publish:*)', 'Bash(rm -rf:*)', 'Bash(rm -fr:*)'];
+const allowedToolsFor = (stage, cwd) => [...new Set([...BASE_ALLOWED_TOOLS, ...(commitsWork(stage, cwd) ? COMMIT_TOOLS : []), ...(stage.allowedTools || [])])];
+
 // ---- run one agent stage on a given tier ----
-function runAgent(stage, tierName, vars, feedback, reworkNote) {
+// opts.resume continues an earlier session (the finalize turn) with opts.prompt and opts.maxTurns.
+function runAgent(stage, tierName, vars, feedback, reworkNote, opts = {}) {
   const tier = TIERS[tierName];
   // ADR 0004: codex tier uses the Codex CLI, not Claude Code
   if (tierName === 'codex') {
     return runCodex(stage, vars, feedback, reworkNote);
   }
   const env = { ...process.env };
+  const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
   // Headless Claude Code on Windows needs Git Bash for its Bash tool; without this, agents have
   // no shell (can't run builds/tests) — found 2026-11-07 when QA couldn't run `npm run build`.
   // Resolution order: env STUDIO_GIT_BASH → .studio/machine.json gitBash → system default.
   if (process.platform === 'win32' && !env.CLAUDE_CODE_GIT_BASH_PATH) {
-    const machineCfg = (() => { try { return JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch { return {}; } })();
     const candidates = [process.env.STUDIO_GIT_BASH, machineCfg.gitBash, 'C:\\Program Files\\Git\\bin\\bash.exe'];
     const found = candidates.find((p) => p && fs.existsSync(p));
     if (found) env.CLAUDE_CODE_GIT_BASH_PATH = found;
   }
-  if (tier.local) Object.assign(env, {
-    ANTHROPIC_BASE_URL: 'http://127.0.0.1:11434', ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
-    ANTHROPIC_MODEL: tier.model, ANTHROPIC_DEFAULT_OPUS_MODEL: tier.model, ANTHROPIC_DEFAULT_SONNET_MODEL: tier.model,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'qwen3:4b', CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  });
+  if (tier.local) Object.assign(env, localTierEnv(tier, machineCfg));
   let prompt = fill(stage.task, vars);
   const cwd = workdir(vars);
   prompt += studioRules(stage, cwd);
-  if (stage.expect?.length) prompt += `\nYou MUST create/update these files: ${stage.expect.map((e) => fill(e, vars)).join(', ')}.`;
+  prompt += `
+${unattendedRules(stage, cwd)}`;
+  if (stage.expect?.length) prompt += `\nYou MUST create/update these files at exactly these absolute paths (not inside ${cwd} unless the path says so): ${stage.expect.map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}.`;
   if (reworkNote) prompt += `\n\n${reworkNote}`;
   if (feedback) prompt += `\n\nA previous attempt failed these checks; fix them:\n${feedback}`;
-  const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(stage.maxTurns || 25)];
+  if (opts.resume) prompt = opts.prompt;
+  const args = ['-p', '--agent', stage.agent, '--model', tier.model, '--permission-mode', 'acceptEdits', '--output-format', 'json', '--max-turns', String(opts.maxTurns || stage.maxTurns || 25)];
+  if (opts.resume) args.push('--resume', opts.resume);
   // Working outside HQ (e.g. a StudioControlRoom worktree): that checkout has no .claude/agents or
   // hooks, so pass the role definition and HQ's settings (pause hook, event logging) explicitly.
   if (cwd !== REPO) {
@@ -311,7 +394,10 @@ function runAgent(stage, tierName, vars, feedback, reworkNote) {
     if (fs.existsSync(hqSettings)) args.push('--settings', hqSettings);
     args.push('--add-dir', REPO); // HQ docs (backlogs, sprint log, QA, reviews) must stay writable
   }
-  if (stage.allowedTools) args.push('--allowedTools', ...stage.allowedTools);
+  // Headless runs can't answer permission prompts, and lane worktrees are "untrusted" folders whose project
+  // settings Claude Code ignores, so the tools a stage needs (tests, builds, local commits) are granted on the
+  // command line. Pushing, merging and destructive git stay with the ship script and the owner.
+  args.push('--allowedTools', ...allowedToolsFor(stage, cwd), '--disallowedTools', ...DISALLOWED_TOOLS);
   const t0 = Date.now();
   const r = spawnSync(claudeExe(), args, { cwd: workdir(vars), env, input: prompt, encoding: 'utf8', timeout: (stage.timeoutMin || 30) * 60000, maxBuffer: 64 * 1024 * 1024 });
   const parsed = parseRunOutput(r);
@@ -403,18 +489,30 @@ function resolveTeamLead(designPath) {
 // Returns 'none' (no valid FAIL verdict: normal verify/tier logic applies), 'back' (cursor moved to the build
 // stage) or 'blocked'. Only a stage that ran cleanly and wrote a fresh report containing a FAIL verdict counts;
 // missing report, run error, turn cap or empty answer stay genuine failures that climb the tier ladder.
+// Default QA verdict: tolerant of markdown around the verdict ("**VERDICT:** FAIL", "VERDICT: `FAIL`").
+const DEFAULT_FAIL_REGEX = 'VERDICT:[\\s*_`]*FAIL';
+// Rework target: the LAST stage before the cursor named `to` (or `to#N`). A suffixed stage (qa#2) goes to its
+// own item (build#2). An unsuffixed stage (a sprint-wide review after a foreach) goes to the most recent build,
+// not build#1. Returns -1 when there is none.
+function reworkTarget(stages, cur, to, suffix) {
+  for (let i = Math.min(cur, stages.length) - 1; i >= 0; i--) {
+    const id = stages[i].id || '';
+    if (suffix ? id === to + suffix : (id === to || id.startsWith(to + '#'))) return i;
+  }
+  return -1;
+}
 function handleRework(run, stage, vars, res, t0) {
   const rw = stage.rework;
   if (!rw || res.error || res.hitTurnCap || !String(res.result || '').trim()) return 'none';
   const rp = path.resolve(REPO, fill(rw.verdict, vars));
   let txt; try { if (fs.statSync(rp).mtimeMs < t0 - 2000) return 'none'; txt = fs.readFileSync(rp, 'utf8'); } catch { return 'none'; }
-  if (!new RegExp(rw.failRegex || 'VERDICT:\\s*FAIL').test(txt)) return 'none';
+  if (!new RegExp(rw.failRegex || DEFAULT_FAIL_REGEX).test(txt)) return 'none';
   const max = rw.max || 3;
   run.reworks = run.reworks || {};
   const n = run.reworks[stage.id] = (run.reworks[stage.id] || 0) + 1;
   const suffix = (stage.id.match(/#\d+$/) || [''])[0];
   const cur = run.cursor;
-  const target = run.stages.findIndex((s, i) => i < cur && (suffix ? s.id === rw.to + suffix : (s.id === rw.to || s.id.startsWith(rw.to + '#'))));
+  const target = reworkTarget(run.stages, cur, rw.to, suffix);
   // keep history: <name>.md -> <name>-round<N>.md (also forces the next QA/review to write a fresh report)
   const kept = rp.replace(/(\.[^./\\]+)?$/, (e) => `-round${n}${e || ''}`);
   try { fs.renameSync(rp, kept); } catch {}
@@ -435,7 +533,128 @@ function handleRework(run, stage, vars, res, t0) {
   run.cursor = target; save(run);
   return 'back';
 }
-const hooks = { runAgent: (...a) => runAgent(...a) }; // test seam: selftests swap in a fake agent
+// ---- usage-limit waits ----
+const LIMIT_WAIT_MS = Number(process.env.STUDIO_LIMIT_WAIT_MS) || 15 * 60000;
+const LIMIT_MAX_WAITS = Number(process.env.STUDIO_LIMIT_MAX_WAITS) || 48; // 12 h, then the owner decides
+function sleepMs(ms, agentId) { // synchronous like the rest of the engine; wakes early if the studio or the agent's team pauses
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  for (let left = ms; left > 0 && !paused(agentId); left -= 60000) Atomics.wait(cell, 0, 0, Math.min(60000, left));
+}
+
+// ---- local model server check ----
+// 2026-11-11: Ollama was not running after a restart, so both local build attempts failed in seconds with
+// ECONNREFUSED and the stage fell through to Sonnet. A down server is not a failed attempt: check it first,
+// try to start it, wait for it, and only then give up on the local tier for this stage.
+const OLLAMA_WAIT_MS = Number(process.env.STUDIO_OLLAMA_WAIT_MS) || 5 * 60000;
+function ollamaUp(url) {
+  const r = spawnSync(process.execPath, ['-e', `fetch(${JSON.stringify(url + '/api/version')}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))`], { timeout: 10000 });
+  return r.status === 0;
+}
+function ensureLocalServer(agentId) {
+  let cfg = {}; try { cfg = JSON.parse(fs.readFileSync(path.join(REPO, '.studio', 'machine.json'), 'utf8')); } catch {}
+  const url = (cfg.ollama && cfg.ollama.url) || 'http://127.0.0.1:11434';
+  if (ollamaUp(url)) return true;
+  console.log(`  ⚠ local model server ${url} is not answering; starting it and waiting up to ${Math.round(OLLAMA_WAIT_MS / 60000)} min`);
+  ev({ type: 'progress', agent: agentId, pct: 0, status: 'waiting', message: `local model server down; starting Ollama` });
+  try { require('child_process').spawn((cfg.ollama && cfg.ollama.exe) || 'ollama', ['serve'], { detached: true, stdio: 'ignore', windowsHide: true }).on('error', () => {}).unref(); } catch {}
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  for (let left = OLLAMA_WAIT_MS; left > 0 && !paused(agentId); left -= 5000) {
+    Atomics.wait(cell, 0, 0, 5000);
+    if (ollamaUp(url)) { console.log('  ✓ local model server is up'); return true; }
+  }
+  return false;
+}
+
+// ---- finalize turn ----
+// Local QA/review runs often spend every turn exploring and hit the turn cap before writing the report
+// (2026-11-07..11: no local HiveBoard QA attempt ever wrote one). Instead of discarding that work, resume the
+// same session for a few turns whose only job is to write the report from what it already found.
+const FINALIZE_TURNS = 8;
+const finalizePrompt = (stage, vars) => 'Your turn budget is used up. Do not explore or run anything else. ' +
+  `Using only what you have already found, write the required report now to: ${(stage.expect || []).map((e) => toSlash(path.resolve(REPO, fill(e, vars)))).join(', ')}. ` +
+  'Mark anything you did not get to as UNVERIFIED. End the file with the required verdict line, then reply with a two-line summary.';
+const canFinalize = (stage, res) => !!(res.hitTurnCap && res.sessionId && stage.expect?.length && !mustChange(stage) && stage.finalizeOnCap !== false);
+
+// ---- reports written in the wrong place ----
+// Agents working in a lane worktree sometimes write an HQ report (docs/internal/review-*.md, QA reports) at
+// the same relative path inside the worktree. The check then sees it as missing and the stage climbs or blocks
+// (2026-11-08/09: lane D and J reviews). Bring a fresh misplaced copy to the HQ path the stage expects.
+// A stale HQ file from an earlier round is moved aside (-stale.md) so it can't pass the check in place of the
+// fresh report. A file the lane has committed is copied, not moved, so the lane tree is left clean.
+const isTracked = (dir, rel) => spawnSync('git', ['ls-files', '--error-unmatch', '--', rel], { cwd: dir, stdio: 'ignore' }).status === 0;
+function adoptMisplacedReports(run, stage, vars, t0) {
+  const wd = workdir(vars);
+  if (wd === REPO) return [];
+  // Only the per-round verdict report may replace an existing HQ file. Plain `expect` files can be shared,
+  // append-only HQ docs (docs/internal/sprint-log.md): those are only adopted when HQ has no copy at all.
+  const verdict = stage.rework && stage.rework.verdict ? fill(stage.rework.verdict, vars) : null;
+  const targets = [...(stage.expect || []).map((x) => fill(x, vars)), ...(verdict ? [verdict] : [])];
+  const fresh = (p) => { try { return fs.statSync(p).mtimeMs >= t0 - 2000; } catch { return false; } };
+  const moved = [];
+  for (const e of new Set(targets)) {
+    const dest = path.resolve(REPO, e);
+    const rel = path.relative(REPO, dest);
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    const src = path.join(wd, rel);
+    try {
+      if (!fs.existsSync(src) || fs.lstatSync(src).isSymbolicLink() || !fresh(src)) continue;
+      if (fs.existsSync(dest)) {
+        if (e !== verdict || fresh(dest)) continue; // shared HQ doc, or the agent wrote the HQ copy too: leave it
+        const stamp = new Date().toISOString().replace(/[-:.]/g, '').slice(0, 15);
+        let aside, i = 0; // never overwrite an older stale copy
+        do aside = dest.replace(/(\.[^./\\]+)?$/, (x) => `-stale-${stamp}${i ? '-' + i : ''}${x || ''}`), i++; while (fs.existsSync(aside));
+        fs.renameSync(dest, aside);
+      }
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      if (isTracked(wd, rel)) fs.copyFileSync(src, dest);
+      else { try { fs.renameSync(src, dest); } catch { fs.copyFileSync(src, dest); try { fs.unlinkSync(src); } catch {} } }
+      moved.push(toSlash(rel));
+    } catch (err) { console.log(`  ! could not adopt ${toSlash(rel)}: ${err.message}`); } // e.g. a locked file on Windows
+  }
+  if (moved.length) {
+    run.history.push({ stage: stage.id, type: 'adopted-report', files: moved, at: now() });
+    console.log(`  ↪ moved report(s) written inside the worktree to HQ: ${moved.join(', ')}`);
+  }
+  return moved;
+}
+
+// ---- refresh rules on resume ----
+// A run keeps the stage list it started with, so pipeline fixes (e.g. the bold-tolerant verdict regexes, #15)
+// never reached runs already in flight. On resume, copy the current pipeline's verdict rules onto matching
+// stages, plus turn/time limits and newly added rework loops. Expanded foreach stages (id#N) get their check
+// re-filled with the run vars and their item number; a check that needs other per-item values is left alone.
+function refreshStages(run) {
+  let pipe; try { pipe = JSON.parse(fs.readFileSync(path.join(PIPES, run.pipeline + '.json'), 'utf8')); } catch { return 0; }
+  const tpl = {};
+  const walk = (stages) => { for (const s of stages || []) { if (s.id && !(s.id in tpl)) tpl[s.id] = s; if (s.type === 'foreach') walk(s.stages); } };
+  walk(pipe.stages);
+  let changed = 0;
+  // Runs started before vars were normalised hold Windows paths; backslashes break the JS checks they fill.
+  for (const k of ['home', 'soft', 'workdir']) if (typeof run.vars?.[k] === 'string' && run.vars[k].includes('\\')) { run.vars[k] = toSlash(run.vars[k]); changed++; }
+  const esc = (o) => Object.fromEntries(Object.entries(o || {}).map(([k, v]) => [k, JSON.stringify(String(v ?? '')).slice(1, -1)]));
+  for (const s of run.stages || []) {
+    const m = /#(\d+)$/.exec(String(s.id || ''));
+    const t = tpl[String(s.id || '').replace(/#\d+$/, '')];
+    if (!t) continue;
+    // a foreach not expanded yet has no per-item values: take its inner stages from the template wholesale
+    if (s.type === 'foreach' && t.type === 'foreach') { if (JSON.stringify(s.stages) !== JSON.stringify(t.stages)) { s.stages = JSON.parse(JSON.stringify(t.stages)); changed++; } continue; }
+    // turn and time limits carry no per-item values
+    for (const k of ['maxTurns', 'timeoutMin']) if (t[k] !== undefined && s[k] !== t[k]) { s[k] = t[k]; changed++; }
+    if (t.rework && !s.rework) { // a stage that gained a rework loop since the run started
+      s.rework = JSON.parse(JSON.stringify(t.rework));
+      if (m) s.rework.verdict = fill(s.rework.verdict, { ...run.vars, n: Number(m[1]) });
+      changed++;
+    } else if (s.rework && t.rework) for (const k of ['failRegex', 'max']) if (t.rework[k] !== undefined && s.rework[k] !== t.rework[k]) { s.rework[k] = t.rework[k]; changed++; }
+    if (t.check) {
+      // an expanded stage's check embeds its item number: re-fill the template, and use it only if nothing is left unfilled
+      const want = m ? fill(t.check, { ...esc(run.vars), n: Number(m[1]) }) : t.check;
+      if (!(m && /\{\{\w+\}\}/.test(want)) && s.check !== want) { s.check = want; changed++; }
+    }
+  }
+  return changed;
+}
+
+const hooks = { runAgent: (...a) => runAgent(...a), sleep: (ms, agentId) => sleepMs(ms, agentId), localReady: (agentId) => ensureLocalServer(agentId) }; // test seams: selftests swap in fakes
 
 // ---- the state machine ----
 // ---- postmortem stubs (S2) ----
@@ -447,7 +666,7 @@ function writePostmortem(run, stage) {
   const fname = `${run.id}-${stage.id}.md`;
   const filePath = path.resolve(REPO, 'docs', 'postmortems', fname);
   fs.mkdirSync(dir, { recursive: true });
-  const stageHistory = (run.history || []).filter((h) => h.stage === stage.id);
+  const stageHistory = (run.history || []).filter((h) => h.stage === stage.id && !['usage-limit', 'adopted-report', 'manager-reset'].includes(h.type));
   const tiersTried = [...new Set(stageHistory.map((h) => h.tier).filter(Boolean))];
   let lines = [
     `# Postmortem: ${run.id} → ${stage.id}`,
@@ -550,15 +769,26 @@ function advance(run) {
     const ladder = LADDER[stage.tier || 'local'];
     let feedback = null, done = false, reworked = false;
     const reworkNote = run.reworkNotes && run.reworkNotes[stage.id];
+    let localDown = false;
     for (let attempt = 0; attempt < ladder.length && !done; attempt++) {
       const tierName = ladder[attempt];
       if (paused(stage.agent)) break;
+      if (TIERS[tierName].local && (localDown || !hooks.localReady(stage.agent))) {
+        if (paused(stage.agent)) break;
+        if (!localDown) {
+          localDown = true;
+          run.history.push({ stage: stage.id, type: 'local-down', tier: tierName, at: now(), note: 'local model server unreachable; skipped without counting an attempt' });
+          console.log(`  ⚠ local model server unreachable; skipping the local tier for ${stage.id}`);
+          save(run);
+        }
+        continue;
+      }
       if (['sonnet', 'opus'].includes(tierName)) writePostmortem(run, stage);
-      ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]` });
+      ev({ type: 'start', agent: stage.agent, from: 'manager', task: `${stage.id} [${tierName}${attempt ? ', retry ' + attempt : ''}]`, tier: tierName, model: TIERS[tierName].model, cloud: !TIERS[tierName].local });
       console.log(`▶ ${stage.id} → ${stage.agent} on ${tierName} (${TIERS[tierName].model})${attempt ? ' [attempt ' + (attempt + 1) + ']' : ''}`);
       const before = treeSnapshot(workdir(vars));
       const t0 = Date.now();
-      const res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
+      let res = hooks.runAgent(stage, tierName, vars, feedback, reworkNote);
       // Codex rate/usage limit or missing binary: skip the tier (not a failure) and fall through (ADR 0004).
       if (res.limited || res.skipped) {
         const why = res.skipped ? 'unavailable' : 'limited';
@@ -567,6 +797,34 @@ function advance(run) {
         console.log(`  skip: ${tierName} ${why}`);
         continue;
       }
+      if (canFinalize(stage, res) && !paused(stage.agent)) {
+        console.log(`  ↻ hit the turn cap after ${res.turns ?? '?'} turns; finalize turn to write the report`);
+        const fin = hooks.runAgent(stage, tierName, vars, null, null, { resume: res.sessionId, prompt: finalizePrompt(stage, vars), maxTurns: FINALIZE_TURNS });
+        run.history.push({ stage: stage.id, type: 'finalize', tier: tierName, secs: fin.secs, turns: fin.turns, ok: !fin.error && !fin.hitTurnCap, at: now() });
+        res = { ...fin, secs: (res.secs || 0) + (fin.secs || 0), turns: (res.turns || 0) + (fin.turns || 0), finalized: true };
+      }
+      if (res.usageLimit && !TIERS[tierName].local) {
+        run.limitWaits = (run.limitWaits || 0) + 1;
+        run.history.push({ stage: stage.id, type: 'usage-limit', tier: tierName, wait: run.limitWaits, at: now(), note: String(res.result || res.error || '').slice(0, 200) });
+        if (run.limitWaits > LIMIT_MAX_WAITS) {
+          run.status = 'blocked'; run.blockedReason = `${tierName} usage limit did not reset after ${LIMIT_MAX_WAITS} waits`;
+          run.limitWaits = 0; delete run.limitUntil; save(run); // a later resume gets a full set of waits again
+          ev({ type: 'gate', agent: 'owner', run: run.id, message: `Blocked: ${stage.id}. ${run.blockedReason}.` });
+          console.log(`\n⛔ BLOCKED at ${stage.id}: ${run.blockedReason}`);
+          return;
+        }
+        // Status stays 'running' (every Control Room view already knows it); limitUntil says why it is idle.
+        // If the engine dies mid-wait, `resume` picks the run up like any other interrupted run.
+        run.limitUntil = new Date(Date.now() + LIMIT_WAIT_MS).toISOString(); save(run);
+        ev({ type: 'progress', agent: stage.agent, pct: 0, status: 'waiting', message: `${stage.id}: ${tierName} usage limit hit; waiting ${Math.round(LIMIT_WAIT_MS / 60000)} min, then retrying` });
+        console.log(`  ⏸ ${tierName} usage limit hit; waiting ${Math.round(LIMIT_WAIT_MS / 60000)} min (wait ${run.limitWaits}/${LIMIT_MAX_WAITS})`);
+        hooks.sleep(LIMIT_WAIT_MS, stage.agent);
+        delete run.limitUntil; save(run);
+        if (paused(stage.agent)) break; // the owner paused during the wait: the normal paused path below saves the run
+        attempt--; continue; // same tier again; a usage limit is not a failed attempt
+      }
+      run.limitWaits = 0;
+      adoptMisplacedReports(run, stage, vars, t0);
       const rwState = handleRework(run, stage, vars, res, t0);
       if (rwState === 'blocked') return;
       if (rwState === 'back') { reworked = true; break; }
@@ -618,9 +876,11 @@ if (require.main === module) {
 		for (const k of pipe.required || []) if (!run.vars[k]) { console.error(`missing --var ${k}=...`); process.exit(1); }
 		save(run); console.log(`Run ${id} started: ${pipe.description || ''}`); advance(run);
 	} else if (cmd === 'resume') {
-		const run = load(rest[0]); run.status = 'running'; save(run); advance(run);
+		const run = load(rest[0]); run.status = 'running'; run.limitWaits = 0; delete run.limitUntil;
+		const n = refreshStages(run); if (n) console.log(`Refreshed ${n} stage rule(s) from the current ${run.pipeline} pipeline.`);
+		save(run); advance(run);
 	} else if (cmd === 'approve') {
-		const run = load(rest[0]); const decision = rest[1] || 'approve';
+		const run = load(rest[0]); const decision = rest[1] || 'approve'; refreshStages(run);
 		const gid = Object.keys(run.gates).find((k) => run.gates[k].status === 'waiting');
 		if (!gid) { console.log('No gate is waiting.'); process.exit(0); }
 		Object.assign(run.gates[gid], { status: decision === 'reject' ? 'rejected' : 'approved', note: rest[2] || '', decided: now() });
@@ -634,4 +894,4 @@ if (require.main === module) {
 	} else console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 16).join('\n'));
 }
 
-module.exports = { advance, hooks, parseRunOutput, parseCodexOutput, runCodex, findCodex, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
+module.exports = { advance, hooks, localTierEnv, isUsageLimit, adoptMisplacedReports, refreshStages, allowedToolsFor, DISALLOWED_TOOLS, unattendedRules, parseRunOutput, parseCodexOutput, runCodex, findCodex, isCliErrorResult, reworkTarget, DEFAULT_FAIL_REGEX, verify, resolveTeamLead, agentDefinition, treeSnapshot, mustChange, writePostmortem, checkRequires, fill, REPO };
