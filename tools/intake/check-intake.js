@@ -12,6 +12,7 @@ const ENUMS = {
   priority: ['P1', 'P2', 'P3'],
   route: ['quick-fix', 'lite', 'full', 'needs-owner'],
 };
+const BUILD_ROLES = ['frontend-dev', 'backend-dev', 'mobile-dev', 'devops-engineer'];
 const SECTIONS = [
   'Original request',
   'Problem',
@@ -77,6 +78,9 @@ function checkIntake(markdown) {
 
   if ('Team' in sections && !/^\s*Team:\s*\S+/m.test(stripComments(sections.Team))) {
     problems.push('Team: line required');
+  } else if ('Team' in sections && out.route !== 'needs-owner') {
+    const line = stripComments(sections.Team).split('\n').find((l) => /^\s*Team:/.test(l)) || '';
+    if (!BUILD_ROLES.some((r) => line.includes(r))) problems.push('Team: line needs a build role');
   }
   if ('Work order' in sections && !/^###\s+Milestone\b/m.test(sections['Work order'])) {
     problems.push('Work order needs at least one "### Milestone" heading');

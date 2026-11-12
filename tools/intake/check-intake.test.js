@@ -83,3 +83,12 @@ test('email-like tokens that are not emails pass', () => {
   const bad = checkIntake(fixture({ extra: 'jane.doe@mail.co' }));
   assert.ok(bad.problems.includes('remove submitter email'));
 });
+
+test('Team needs a build role unless needs-owner', () => {
+  const bad = checkIntake(fixture({ team: 'Team: qa-engineer, code-reviewer' }));
+  assert.ok(bad.problems.includes('Team: line needs a build role'));
+  const owner = checkIntake(fixture({ route: 'needs-owner', team: 'Team: qa-engineer' }));
+  assert.ok(!owner.problems.includes('Team: line needs a build role'));
+  const ok = checkIntake(fixture({ team: 'Team: devops-engineer, qa-engineer' }));
+  assert.ok(!ok.problems.includes('Team: line needs a build role'));
+});
