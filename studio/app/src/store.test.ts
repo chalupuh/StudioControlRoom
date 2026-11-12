@@ -182,7 +182,7 @@ describe('live model', () => {
     expect(r['mobile-dev'].cloud).toBe(false);
   });
   it('falls back to the [tier] tag in older events', () => {
-    expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'qa#2 [sonnet, retry 2]' })).toEqual({ model: 'sonnet', tier: 'sonnet', cloud: true });
+    expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'qa#2 [sonnet, retry 2]' })).toEqual({ model: 'sonnet', tier: 'sonnet', cloud: true, provider: 'claude' });
     expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'qa#2 [local-fast]' }).model).toBe('qwen3-coder:30b');
     expect(modelOf({ ts: 1, type: 'start', agent: 'x', task: 'no tag' })).toEqual({});
   });
@@ -201,5 +201,27 @@ describe('live model', () => {
     });
     expect(g.map((x) => x.model)).toEqual(['qwen3.6:27b', 'opus']);
     expect(g[0].agents).toEqual(['b']);
+  });
+});
+
+import { providerOf } from './store';
+describe('providers', () => {
+  it('classifies local, Claude and ChatGPT', () => {
+    expect(providerOf('qwen3.6:27b', 'local', false)).toBe('local');
+    expect(providerOf('opus', 'opus', true)).toBe('claude');
+    expect(providerOf('gpt-6.1-sol', 'codex', true)).toBe('chatgpt');
+    expect(providerOf('codex', undefined, undefined)).toBe('chatgpt');
+  });
+  it('start events from the codex tier are ChatGPT', () => {
+    const r = deriveLive([{ ts: 1, type: 'start', agent: 'backend-dev', task: 'build#3 [codex]' }]);
+    expect(r['backend-dev'].provider).toBe('chatgpt');
+  });
+  it('panel groups by provider: local, Claude, ChatGPT', () => {
+    const g = groupByModel({
+      a: { status: 'working', pct: 1, task: '', model: 'gpt-6.1-sol', cloud: true, provider: 'chatgpt' },
+      b: { status: 'working', pct: 1, task: '', model: 'opus', cloud: true, provider: 'claude' },
+      c: { status: 'working', pct: 1, task: '', model: 'qwen3.6:27b', cloud: false, provider: 'local' },
+    });
+    expect(g.map((x) => x.provider)).toEqual(['local', 'claude', 'chatgpt']);
   });
 });
