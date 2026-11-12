@@ -483,8 +483,10 @@ const requiresCommit = (dir) => !!dir && dir !== REPO && !['main', 'master'].inc
 const SEVERITY_RX = /\b(blockers?|should[- ]fix|nits?|critical|major|minor|high|medium|low)\b/i;
 const FILEREF_RX = /[\w./\\[\]-]+\.\w{1,6}:\d+/;
 const ID_RX = /^([BSNFR]-?\d{1,3}[a-z]?)(?![\w/=-])/;
-const OPEN_STATUS_RX = /^(?:NOT FIXED|STILL FAILING|STILL OPEN|FAILING|FAILED|FAIL|OPEN|UNVERIFIED)\b/i;
-const FIXED_STATUS_RX = /^FIXED\b/i;
+// Lead-in FIXED must be upper-case and stand alone (so "Fixed-size buffer ..." is a title, not a status). Table status cells are looser.
+const FIXED_STATUS_RX = /^FIXED(?![\w-])(?:\s*$|\s*[.:(\u2014\u2013,;])/;
+const isFixedCell = (c) => /^fixed(?![\w-])/i.test(c);
+const isOpenCell = (c) => /^(?:not fixed|still failing|still open|failing|failed|fail|unverified)(?![\w-])/i.test(c) || /^OPEN(?![\w-])/.test(c);
 const MD_LEAD = /^(?:\*\*|__|`)+/;
 const normSev = (s) => { const t = String(s || '').toLowerCase().replace(/[-\s]+/g, ' ').trim(); if (/^blocker/.test(t)) return 'blocker'; if (/^nit/.test(t)) return 'nit'; return t || null; };
 const idSeverity = (id) => ({ B: 'blocker', S: 'should fix', N: 'nit' })[id[0]] || null;
@@ -512,37 +514,44 @@ function leadId(line) {
   if (rest.length < 6) return null;
   return { id, rest };
 }
-function tableFinding(line) {
-  const cells = line.replace(/^\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+const tableCells = (line) => line.replace(/^\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+// Header row naming a Status column -> its index (else -1).
+const statusHeader = (line) => tableCells(line).findIndex((c) => /^status$/i.test(stripMd(c)));
+// ID'd table row -> { id, fixed, status, rest, ref } or null. A row with no recognisable status cell is an OPEN finding.
+function tableFinding(line, statusCol = -1) {
+  const cells = tableCells(line);
   const idm = ID_RX.exec(stripMd(cells[0]));
   if (!idm || cells.length < 2) return null;
-  const si = cells.findIndex((c, i) => i > 0 && (OPEN_STATUS_RX.test(stripMd(c)) || FIXED_STATUS_RX.test(stripMd(c))));
-  if (si < 0) return null;
-  const st = stripMd(cells[si]);
+  let si = statusCol > 0 && statusCol < cells.length ? statusCol : -1;
+  if (si < 0) si = cells.findIndex((c, i) => i > 0 && (isOpenCell(stripMd(c)) || isFixedCell(stripMd(c))));
+  const st = si >= 0 ? stripMd(cells[si]) : '';
   const rest = cells.filter((c, i) => i > 0 && i !== si).map(stripMd).filter(Boolean).join(' - ');
-  return { id: idm[1], fixed: !OPEN_STATUS_RX.test(st), status: st.split(/[;(:,]/)[0].trim().toUpperCase(), rest, ref: (FILEREF_RX.exec(cells.join(' ')) || [])[0] || null };
+  const fixed = !!st && isFixedCell(st) && !isOpenCell(st);
+  return { id: idm[1], fixed, status: st ? st.split(/[;(:,]/)[0].trim().toUpperCase() : 'OPEN', rest, ref: (FILEREF_RX.exec(cells.join(' ')) || [])[0] || null };
 }
 function extractFindings(txt) {
-  const items = []; const fixed = new Set(); const openTable = new Set(); let section = null, cur = null;
-  const add = (f) => { const o = items.find((x) => x.id && idKey(x.id) === idKey(f.id)); if (!o) items.push(f); else if (!o.ref && f.ref) o.ref = f.ref; return o || f; };
+  const items = []; const fixed = new Set(); const openTable = new Set(); let section = null, cur = null, statusCol = -1;
+  const add = (f) => { const o = items.find((x) => x.id && idKey(x.id) === idKey(f.id)); if (!o) items.push(f); else if (!o.explicit) { items[items.indexOf(o)] = f; if (!f.ref) f.ref = o.ref; return f; } else if (!o.ref && f.ref) o.ref = f.ref; return o || f; };
   for (const raw of String(txt || '').split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || (/VERDICT|REQUEST CHANGES|^APPROVE/i.test(line) && line.length < 60)) continue;
     if (line[0] === '|') {
       cur = null;
-      const t = tableFinding(line); if (!t) continue;
+      const hc = statusHeader(line); if (hc >= 0) { statusCol = hc; continue; }
+      const t = tableFinding(line, statusCol); if (!t) continue;
       if (t.fixed) { fixed.add(idKey(t.id)); continue; }
       openTable.add(idKey(t.id));
-      add({ id: t.id, severity: idSeverity(t.id) || section, ref: t.ref, text: `[${t.status}] ${t.rest}`.slice(0, 300) });
+      add({ id: t.id, severity: idSeverity(t.id) || section, ref: t.ref, text: `[${t.status}] ${t.rest}`.slice(0, 300), explicit: true });
       continue;
     }
+    statusCol = -1;
     const heading = /^#{1,6}\s+(.*)$/.exec(line);
     const lead = leadId(line);
     if (lead) {
       cur = null;
       if (lead.fixed) { fixed.add(idKey(lead.id)); continue; }
       const sm = SEVERITY_RX.exec(lead.rest);
-      cur = add({ id: lead.id, severity: idSeverity(lead.id) || (sm ? normSev(sm[1]) : section), ref: (FILEREF_RX.exec(lead.rest) || [])[0] || null, text: clean(lead.rest) });
+      cur = add({ id: lead.id, severity: idSeverity(lead.id) || (sm ? normSev(sm[1]) : section), ref: (FILEREF_RX.exec(lead.rest) || [])[0] || null, text: clean(lead.rest), explicit: true });
       continue;
     }
     if (heading) cur = null;
@@ -561,7 +570,9 @@ function extractFindings(txt) {
   }
   // drop repeats of an ID, and anything marked FIXED (unless a status table also lists it as still open)
   const seen = new Set(); const kept = [];
+  const explicitKeys = new Set(items.filter((f) => f.explicit).map((f) => idKey(f.id)));
   for (const f of items) {
+    if (!f.explicit && f.id && explicitKeys.has(idKey(f.id))) continue;
     if (f.id) { const k = idKey(f.id); if (seen.has(k)) continue; seen.add(k); if (fixed.has(k) && !openTable.has(k)) continue; }
     kept.push(f);
   }
@@ -575,20 +586,30 @@ function extractFindings(txt) {
 // Blockers (and Should-fix) sections verbatim: used when the report has a non-empty Blockers section but no blocker
 // reached the checklist, so blockers can never silently drop. Returns '' when no fallback is needed.
 function findingsFallback(txt, findings) {
-  if ((findings || []).some((f) => f.severity === 'blocker')) return '';
-  const secs = { blocker: [], should: [] }; let cur = null;
+  const secs = { blocker: [], should: [] }; let cur = null, curLevel = 0, statusCol = -1;
+  const mentioned = new Set(); const fixedIds = new Set();
   for (const raw of String(txt || '').split(/\r?\n/)) {
-    const h = /^#{1,6}\s+(.*)$/.exec(raw.trim());
-    if (h) {
-      const t = stripMd(h[1]);
+    const line = raw.trim();
+    if (line[0] === '|') {
+      const hc = statusHeader(line); if (hc >= 0) { statusCol = hc; continue; }
+      const t = tableFinding(line, statusCol);
+      if (t && /^B/.test(t.id)) (t.fixed ? fixedIds : mentioned).add(idKey(t.id));
+    } else statusCol = -1;
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (h && !(cur && h[1].length > curLevel)) { // a deeper heading (### B-1.) stays inside the current section
+      const t = stripMd(h[2]); curLevel = h[1].length;
       cur = /^blockers?\b/i.test(t) && t.length < 50 ? 'blocker' : /^should[- ]fix\b/i.test(t) && t.length < 50 ? 'should' : null;
       if (cur) secs[cur].push(raw);
       continue;
     }
     if (cur) secs[cur].push(raw);
+    if (cur === 'blocker' && line[0] !== '|') for (const m of line.matchAll(/(?<![\w-])B-?\d{1,3}[a-z]?(?![\w-])/g)) mentioned.add(idKey(m[0]));
   }
   const content = secs.blocker.slice(1).map((l) => l.trim()).filter((l) => l && l !== '---');
   if (!content.length || content.every((l) => /^(?:[-*]\s*)?(?:\*\*)?(?:none|n\/a|no blockers?)\b/i.test(l))) return '';
+  const have = new Set((findings || []).map((f) => idKey(f.id)));
+  const missing = [...mentioned].filter((k) => !fixedIds.has(k) && !have.has(k));
+  if ((findings || []).some((f) => f.severity === 'blocker') && !missing.length) return '';
   const body = [...secs.blocker, ...secs.should].join('\n').trim();
   return body.length > 6000 ? body.slice(0, 6000) + '\n[... truncated; read the full report]' : body;
 }

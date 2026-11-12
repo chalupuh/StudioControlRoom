@@ -69,5 +69,29 @@ const rank = (f, id) => ids(f).indexOf(id);
   check(q.indexOf('B-1 ') < q.indexOf('S-1 ') && q.indexOf('S-7') < q.indexOf('N-13'), 'prompt checklist is ordered B, S, N');
   check(!/copied verbatim/.test(q), 'no fallback block when blockers were extracted');
 }
+// Review follow-ups: S1 (title that merely starts with "Fixed"), S2 (partial blocker loss), S3 (status-less rows), nits.
+{
+  const f = engine.extractFindings('### B-2: Fixed-size buffer overflows in src/a.ts:10\nbody\n### B-3: FIXED\n');
+  check(ids(f).join() === 'B-2', 'S1: "Fixed-size buffer ..." title is a finding; a bare FIXED lead-in is not');
+  const g = engine.extractFindings('| ID | Sev | Status | Note |\n|---|---|---|---|\n| B-3 | Blocker | src/x.ts:4 | race |\n| B-4 | Blocker | Fixed | ok |\n| S-3 | Should | OPEN | todo |\n');
+  check(ids(g).join() === 'B-3,S-3', 'S3: a row with no status cell is open; header Status column preferred (Fixed dropped)');
+  check(g[0].ref === 'src/x.ts:4', 'S3: status-less row keeps its file:line');
+  const h = engine.extractFindings('| ID | Evidence | Status |\n|---|---|---|\n| B-5 | the open items are listed in OPEN.md:3 | FIXED |\n');
+  check(h.length === 0, 'nit: Status header column decides, not other cells');
+  const o = engine.extractFindings('| B-6 | open question | fail-safe path |\n');
+  check(ids(o).join() === 'B-6', 'nit: lower-case "open" in prose is not a status; the row is open');
+  const l = engine.extractFindings('- B-1 is a severe issue in `a.js:1` for sure\n### B-1. Real title for the blocker\n');
+  check(l.length === 1 && /Real title/.test(l[0].text), 'nit: legacy prose match does not supply text for an ID with a real lead-in');
+}
+{
+  const rep = '## Blockers\n\n### B-1. Parsed one is fine\n\nB-2 is described in plain prose only, with no lead-in at all.\n\n## Nits\n- **N-1** `a.js:1` typo\n';
+  const f = engine.extractFindings(rep);
+  check(f.some((x) => x.id === 'B-1') && !f.some((x) => x.id === 'B-2'), 'S2 setup: B-2 is lost from the checklist');
+  check(/B-2 is described/.test(engine.findingsFallback(rep, f)), 'S2: fallback attached when only some blockers were extracted');
+  const ok = '## Blockers\n\n### B-1. Parsed one is fine\n';
+  check(engine.findingsFallback(ok, engine.extractFindings(ok)) === '', 'S2: no fallback when every mentioned blocker is in the checklist');
+  const tbl = '## Blockers\n\n### B-1. Parsed one is fine\n\n| ID | Status |\n|---|---|\n| B-7 | **FIXED** |\n';
+  check(engine.findingsFallback(tbl, engine.extractFindings(tbl)) === '', 'S2: FIXED table blockers do not trigger the fallback');
+}
 if (fails) { console.error(`\n${fails} extractFindings test(s) failed`); process.exit(1); }
 console.log('\nextractFindings tests passed');
